@@ -1,5 +1,9 @@
 # Changelog
 
+## \[0.56.0]
+
+- [`44e26ef`](https://github.com/tauri-apps/wry/commit/44e26ef27428f3b9f8d00f62a6ffda887ea8a982) ([#1712](https://github.com/tauri-apps/wry/pull/1712) by [@cod3rkane](https://github.com/tauri-apps/wry/../../cod3rkane)) On Windows, Add `WebViewExtWindows::hwnd` getter to access the child HWND containing the webview.
+
 ## \[0.55.0]
 
 - [`a535fd9`](https://github.com/tauri-apps/wry/commit/a535fd95025d126dd1d6ad10b101b81ed9ae40fe) ([#1699](https://github.com/tauri-apps/wry/pull/1699) by [@FabianLars](https://github.com/tauri-apps/wry/../../FabianLars)) On Android, fixed panics on custom protocol timeouts. Increased timeout for non-internal requests to 30 seconds.
