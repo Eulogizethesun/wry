@@ -5,7 +5,7 @@ use crate::{Error, Rect, RequestAsyncResponder, Result, RGBA};
 use cookie::Cookie;
 use http::{Request, Response, Uri};
 use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::util::Counter;
 
@@ -26,13 +26,13 @@ impl InnerWebView {
   }
 
   pub(crate) fn new(
-    _window: &impl HasWindowHandle,
+    window: &impl HasWindowHandle,
     attributes: WebViewAttributes,
-    _pl_attrs: super::PlatformSpecificWebViewAttributes,
+    pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self> {
     let WebViewAttributes {
       id,
-      url,
+      ref url,
       html,
       initialization_scripts,
       ipc_handler,
@@ -48,7 +48,7 @@ impl InnerWebView {
       ..
     } = attributes;
 
-    let initial_url = url;
+    let initial_url = url.clone();
     let initial_headers = headers;
 
     let id = id
@@ -57,6 +57,15 @@ impl InnerWebView {
 
     let background_color =
       background_color.map(|c| format!("#{:02X}{:02X}{:02X}{:02X}", c.0, c.1, c.2, c.3));
+
+    // Get window_id from platform-specific attributes
+    let window_id = pl_attrs.window_id.unwrap_or(0);
+
+    let merged_scripts = initialization_scripts
+        .iter()
+        .map(|s| s.script.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut webview_builder = WebViewBuilder::new()
       .id(id.clone())
@@ -68,12 +77,9 @@ impl InnerWebView {
       })
       .javascript_enabled(!javascript_disabled)
       .autoplay(autoplay)
-      .initialization_scripts(vec![initialization_scripts
-        .iter()
-        .map(|s| s.script.clone())
-        .collect::<Vec<_>>()
-        .join("\n")])
-      .transparent(transparent);
+      .initialization_scripts(vec![merged_scripts])
+      .transparent(transparent)
+      .window_id(window_id);
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
     {
@@ -118,7 +124,7 @@ impl InnerWebView {
           .expect("Failed to build web proxy");
       })
       .map_err(|e| {
-        Error::OpenHarmonyInitError(format!("Failed to add controller attach listener: {}", e))
+        Error::OpenHarmonyWebviewError(format!("Failed to add controller attach listener: {}", e))
       })?;
 
     for (protocol, callback) in custom_protocols {

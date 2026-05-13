@@ -1930,13 +1930,24 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
 
 #[cfg(target_env = "ohos")]
 #[derive(Default)]
-pub struct PlatformSpecificWebViewAttributes {}
+pub struct PlatformSpecificWebViewAttributes {
+  /// The OS-level window ID, used to distinguish main (0) vs sub-windows.
+  pub window_id: Option<i64>,
+}
 
 #[cfg(target_env = "ohos")]
-pub trait WebViewBuilderExtOhos {}
+pub trait WebViewBuilderExtOhos {
+  /// Sets the OS-level window ID for the webview.
+  fn with_window_id(self, window_id: i64) -> Self;
+}
 
 #[cfg(target_env = "ohos")]
-impl WebViewBuilderExtOhos for WebViewBuilder<'_> {}
+impl WebViewBuilderExtOhos for WebViewBuilder<'_> {
+  fn with_window_id(mut self, window_id: i64) -> Self {
+    self.platform_specific.window_id = Some(window_id);
+    self
+  }
+}
 
 #[cfg(all(
   any(
