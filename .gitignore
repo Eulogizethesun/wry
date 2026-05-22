@@ -7,3 +7,6 @@ gh-pages
 .DS_Store
 examples/test_video.mp4
 .vscode/
+.sisyphus
+.omc
+Cargo.lock
