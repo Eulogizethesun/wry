@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::WebViewAttributes;
-use crate::{Error, Rect, RequestAsyncResponder, Result, RGBA};
+use crate::{Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
 use cookie::Cookie;
 use http::{Request, Response, Uri};
 use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
@@ -45,6 +47,12 @@ impl InnerWebView {
       autoplay,
       user_agent,
       javascript_disabled,
+      navigation_handler,
+      document_title_changed_handler,
+      on_page_load_handler,
+      new_window_req_handler,
+      download_started_handler,
+      download_completed_handler,
       ..
     } = attributes;
 
@@ -98,6 +106,52 @@ impl InnerWebView {
     if let Some(user_agent) = user_agent {
       webview_builder = webview_builder.user_agent(user_agent);
     }
+
+    // Wire navigation handler (on_navigation → WebViewBuilder::on_navigation_request)
+    if let Some(navigation_handler) = navigation_handler {
+      webview_builder = webview_builder.on_navigation_request(move |url: String| -> bool {
+        navigation_handler(url)
+      });
+    }
+
+    // Wire document title changed handler (on_document_title_changed → WebViewBuilder::on_title_change)
+    if let Some(document_title_changed_handler) = document_title_changed_handler {
+      webview_builder = webview_builder.on_title_change(move |title: String| {
+        document_title_changed_handler(title)
+      });
+    }
+
+    // Wire download started handler (FnMut wrapped in Mutex to satisfy Fn bound)
+    if let Some(download_started_handler) = download_started_handler {
+      let handler = Mutex::new(download_started_handler);
+      webview_builder = webview_builder.on_download_start(move |url: String, path: &mut PathBuf| -> bool {
+        let mut handler = handler.lock().unwrap();
+        handler(url, path)
+      });
+    }
+
+    // Wire download completed handler (Rc<dyn Fn> cloned into closure)
+    if let Some(download_completed_handler) = download_completed_handler {
+      webview_builder = webview_builder.on_download_end(move |url: String, path: Option<PathBuf>, success: bool| {
+        download_completed_handler(url, path, success)
+      });
+    }
+
+    // Wire on_page_load handler (pre-build: onPageBegin/onPageEnd in ArkTS Web component)
+    if let Some(on_page_load_handler) = on_page_load_handler {
+      let handler = Arc::new(on_page_load_handler);
+      let handler_begin = handler.clone();
+      let handler_end = handler.clone();
+      webview_builder = webview_builder.on_page_begin(move |url: String| {
+        handler_begin(PageLoadEvent::Started, url);
+      });
+      webview_builder = webview_builder.on_page_end(move |url: String| {
+        handler_end(PageLoadEvent::Finished, url);
+      });
+    }
+
+    // Suppress unused new_window_req_handler (openharmony-ability has no corresponding interface)
+    let _ = new_window_req_handler;
 
     let webview = webview_builder
       .build()
