@@ -2187,6 +2187,32 @@ impl WebView {
     self.webview.clear_all_browsing_data()
   }
 
+  /// Create a PDF from the current webview content and save to the given path.
+  ///
+  /// Currently only supported on OpenHarmony. On other platforms this is a no-op.
+  #[cfg(target_env = "ohos")]
+  pub fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<ohos::PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    self.webview.create_pdf(path, config, callback)
+  }
+
+  /// Create a PDF from the current webview content and save to the given path.
+  ///
+  /// Currently only supported on OpenHarmony. On other platforms this is a no-op.
+  #[cfg(not(target_env = "ohos"))]
+  pub fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<()>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    self.webview.create_pdf(path, config, callback)
+  }
+
   pub fn bounds(&self) -> Result<Rect> {
     self.webview.bounds()
   }

@@ -345,6 +345,15 @@ impl InnerWebView {
     Ok(())
   }
 
+  pub fn create_pdf(
+    &self,
+    _path: &str,
+    _config: Option<()>,
+    _callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+
   pub fn id(&self) -> crate::WebViewId<'_> {
     &self.id
   }

@@ -1721,6 +1721,15 @@ impl InnerWebView {
     )
   }
 
+  pub fn create_pdf(
+    &self,
+    _path: &str,
+    _config: Option<()>,
+    _callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    Ok(())
+  }
+
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     unsafe {
       self

@@ -897,6 +897,15 @@ r#"Object.defineProperty(window, 'ipc', {
     Ok(())
   }
 
+  pub fn create_pdf(
+    &self,
+    _path: &str,
+    _config: Option<()>,
+    _callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> crate::Result<()> {
+    Ok(())
+  }
+
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
     #[cfg(target_os = "macos")]

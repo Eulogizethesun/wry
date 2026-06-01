@@ -682,6 +682,15 @@ impl InnerWebView {
     Ok(())
   }
 
+  pub fn create_pdf(
+    &self,
+    _path: &str,
+    _config: Option<()>,
+    _callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    Ok(())
+  }
+
   pub fn url(&self) -> Result<String> {
     Ok(self.webview.uri().unwrap_or_default().to_string())
   }
