@@ -1724,7 +1724,6 @@ impl InnerWebView {
   pub fn create_pdf(
     &self,
     _path: &str,
-    _config: Option<()>,
     _callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
     Ok(())

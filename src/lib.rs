@@ -2194,10 +2194,9 @@ impl WebView {
   pub fn create_pdf(
     &self,
     path: &str,
-    config: Option<ohos::PdfConfig>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
-    self.webview.create_pdf(path, config, callback)
+    self.webview.create_pdf(path, callback)
   }
 
   /// Create a PDF from the current webview content and save to the given path.
@@ -2207,10 +2206,9 @@ impl WebView {
   pub fn create_pdf(
     &self,
     path: &str,
-    config: Option<()>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
-    self.webview.create_pdf(path, config, callback)
+    self.webview.create_pdf(path, callback)
   }
 
   pub fn bounds(&self) -> Result<Rect> {
