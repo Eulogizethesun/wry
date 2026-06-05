@@ -2189,20 +2189,8 @@ impl WebView {
 
   /// Create a PDF from the current webview content and save to the given path.
   ///
-  /// Currently only supported on OpenHarmony. On other platforms this is a no-op.
+  /// Currently only supported on OpenHarmony.
   #[cfg(target_env = "ohos")]
-  pub fn create_pdf(
-    &self,
-    path: &str,
-    callback: Box<dyn Fn(bool) + Send + 'static>,
-  ) -> Result<()> {
-    self.webview.create_pdf(path, callback)
-  }
-
-  /// Create a PDF from the current webview content and save to the given path.
-  ///
-  /// Currently only supported on OpenHarmony. On other platforms this is a no-op.
-  #[cfg(not(target_env = "ohos"))]
   pub fn create_pdf(
     &self,
     path: &str,
