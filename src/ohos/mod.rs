@@ -63,8 +63,9 @@ impl InnerWebView {
       .map(|id| id.to_string())
       .unwrap_or_else(|| COUNTER.next().to_string());
 
-    let background_color =
-      background_color.map(|c| format!("#{:02X}{:02X}{:02X}{:02X}", c.0, c.1, c.2, c.3));
+    let background_color = background_color.map(|c| {
+      ((c.3 as u32) << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
+    });
 
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
@@ -240,8 +241,16 @@ impl InnerWebView {
       .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set zoom: {}", e)))
   }
 
-  pub fn set_background_color(&self, _background_color: RGBA) -> Result<()> {
-    Ok(())
+  pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
+    log::debug!("[WRY] set_background_color called with RGBA: {:?}", background_color);
+    // Convert RGBA(r,g,b,a) to 0xAARRGGBB number format for OHOS
+    let color_number = ((background_color.3 as u32) << 24)  // AA (alpha)
+                     | ((background_color.0 as u32) << 16)  // RR (red)
+                     | ((background_color.1 as u32) << 8)   // GG (green)
+                     | (background_color.2 as u32);          // BB (blue)
+    log::debug!("[WRY] Converted to u32: 0x{:08X}", color_number);
+    self.webview.set_background_color(color_number)
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set background color: {}", e)))
   }
 
   pub fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
