@@ -151,8 +151,29 @@ impl InnerWebView {
       });
     }
 
-    // Suppress unused new_window_req_handler (openharmony-ability has no corresponding interface)
-    let _ = new_window_req_handler;
+    // Bridge new_window_req_handler to openharmony-ability's on_window_new.
+    // Note: this callback runs on the ArkUI JS thread, not the Rust event loop thread.
+    if let Some(new_window_req_handler) = new_window_req_handler {
+      webview_builder = webview_builder.on_window_new(
+        move |target_url: String, _is_alert: bool, _is_user_trigger: bool| -> bool {
+          let features = crate::NewWindowFeatures {
+            size: None,
+            position: None,
+            opener: crate::NewWindowOpener {},
+          };
+          match new_window_req_handler(target_url, features) {
+            crate::NewWindowResponse::Allow => true,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            crate::NewWindowResponse::Create { .. } => {
+              // OHOS: Create is not supported, degrade to Allow
+              log::warn!("[WRY] NewWindowResponse::Create degraded to Allow on OHOS");
+              true
+            }
+            crate::NewWindowResponse::Deny => false,
+          }
+        },
+      );
+    }
 
     let webview = webview_builder
       .build()
