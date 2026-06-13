@@ -373,6 +373,9 @@ pub mod prelude {
 }
 #[cfg(target_os = "android")]
 pub use android::JniHandle;
+
+#[cfg(target_env = "ohos")]
+pub use ohos::OhosWebviewHandle;
 #[cfg(target_os = "android")]
 use android::*;
 
@@ -2500,6 +2503,21 @@ impl WebViewExtAndroid for WebView {
     JniHandle {
       activity_id: self.webview.activity_id,
     }
+  }
+}
+
+#[cfg(target_env = "ohos")]
+/// Additional methods on `WebView` that are specific to OpenHarmony
+pub trait WebViewExtOhos {
+  /// Returns the OHOS webview handle for accessing platform-specific APIs
+  /// (e.g., `web_page_snapshot`).
+  fn webview_handle(&self) -> OhosWebviewHandle;
+}
+
+#[cfg(target_env = "ohos")]
+impl WebViewExtOhos for WebView {
+  fn webview_handle(&self) -> OhosWebviewHandle {
+    self.webview.webview.clone()
   }
 }
 
