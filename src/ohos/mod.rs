@@ -1,12 +1,14 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::WebViewAttributes;
 use crate::{Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
 use cookie::Cookie;
 use http::{Request, Response, Uri};
 use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
+pub use openharmony_ability::PdfConfig;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// Re-export of `openharmony_ability::Webview` for use in wry's public API.
@@ -25,6 +27,7 @@ static COUNTER: Counter = Counter::new();
 pub struct InnerWebView {
   id: String,
   pub(crate) webview: Webview,
+  page_loaded: Arc<AtomicBool>,
 }
 
 impl InnerWebView {
@@ -72,9 +75,8 @@ impl InnerWebView {
       .map(|id| id.to_string())
       .unwrap_or_else(|| COUNTER.next().to_string());
 
-    let background_color = background_color.map(|c| {
-      ((c.3 as u32) << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
-    });
+    let background_color =
+      background_color.map(|c| ((c.3 as u32) << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32));
 
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
@@ -147,16 +149,30 @@ impl InnerWebView {
       });
     }
 
+    // Track page loaded state for create_pdf readiness check
+    let page_loaded = Arc::new(AtomicBool::new(false));
+    let page_loaded_begin = page_loaded.clone();
+    let page_loaded_end = page_loaded.clone();
+
     // Wire on_page_load handler (pre-build: onPageBegin/onPageEnd in ArkTS Web component)
     if let Some(on_page_load_handler) = on_page_load_handler {
       let handler = Arc::new(on_page_load_handler);
       let handler_begin = handler.clone();
       let handler_end = handler.clone();
       webview_builder = webview_builder.on_page_begin(move |url: String| {
+        page_loaded_begin.store(false, Ordering::SeqCst);
         handler_begin(PageLoadEvent::Started, url);
       });
       webview_builder = webview_builder.on_page_end(move |url: String| {
+        page_loaded_end.store(true, Ordering::SeqCst);
         handler_end(PageLoadEvent::Finished, url);
+      });
+    } else {
+      webview_builder = webview_builder.on_page_begin(move |_: String| {
+        page_loaded_begin.store(false, Ordering::SeqCst);
+      });
+      webview_builder = webview_builder.on_page_end(move |_: String| {
+        page_loaded_end.store(true, Ordering::SeqCst);
       });
     }
 
@@ -225,7 +241,7 @@ impl InnerWebView {
         .unwrap();
     }
 
-    Ok(Self { id, webview })
+    Ok(Self { id, webview, page_loaded })
   }
 
   pub fn print(&self) -> crate::Result<()> {
@@ -350,6 +366,24 @@ impl InnerWebView {
     self.webview.clear_all_browsing_data().map_err(|e| {
       Error::OpenHarmonyWebviewError(format!("Failed to clear all browsing data: {}", e))
     })
+  }
+
+  pub fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    if !self.page_loaded.load(Ordering::SeqCst) {
+      callback(false);
+      return Err(Error::OpenHarmonyWebviewError(
+        "Page not fully loaded. Call createPdf after onPageEnd.".into(),
+      ));
+    }
+    self
+      .webview
+      .create_pdf(path, config, callback)
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to create PDF: {}", e)))
   }
 
   pub fn bounds(&self) -> Result<Rect> {
