@@ -2194,9 +2194,10 @@ impl WebView {
   pub fn create_pdf(
     &self,
     path: &str,
+    config: Option<openharmony_ability::PdfConfig>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
-    self.webview.create_pdf(path, callback)
+    self.webview.create_pdf(path, config, callback)
   }
 
   pub fn bounds(&self) -> Result<Rect> {

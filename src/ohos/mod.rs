@@ -7,6 +7,7 @@ use crate::{Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
 use cookie::Cookie;
 use http::{Request, Response, Uri};
 use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
+pub use openharmony_ability::PdfConfig;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::util::Counter;
@@ -64,7 +65,7 @@ impl InnerWebView {
       .unwrap_or_else(|| COUNTER.next().to_string());
 
     let background_color =
-      background_color.map(|c| format!("#{:02X}{:02X}{:02X}{:02X}", c.0, c.1, c.2, c.3));
+      background_color.map(|c| ((c.0 as u32) << 24) | ((c.1 as u32) << 16) | ((c.2 as u32) << 8) | (c.3 as u32));
 
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
@@ -316,11 +317,12 @@ impl InnerWebView {
   pub fn create_pdf(
     &self,
     path: &str,
+    config: Option<PdfConfig>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
     self
       .webview
-      .create_pdf(path, callback)
+      .create_pdf(path, config, callback)
       .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to create PDF: {}", e)))
   }
 
