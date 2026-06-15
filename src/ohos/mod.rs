@@ -9,13 +9,22 @@ use http::{Request, Response, Uri};
 use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+/// Re-export of `openharmony_ability::Webview` for use in wry's public API.
+/// Provides access to the OHOS webview handle (e.g., for `web_page_snapshot`).
+///
+/// Note: This intentionally exposes the full upstream API surface, consistent
+/// with other platforms (macOS `WryWebView`, Windows `ICoreWebView2Controller`,
+/// Android `JniHandle`). Users are responsible for correct usage of the
+/// underlying OHOS webview APIs.
+pub type OhosWebviewHandle = Webview;
+
 use crate::util::Counter;
 
 static COUNTER: Counter = Counter::new();
 
 pub struct InnerWebView {
   id: String,
-  webview: Webview,
+  pub(crate) webview: Webview,
 }
 
 impl InnerWebView {
