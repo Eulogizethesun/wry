@@ -1,14 +1,16 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::WebViewAttributes;
 use crate::{Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
 use cookie::Cookie;
 use http::{Request, Response, Uri};
-use openharmony_ability::{native_web::WebProxyBuilder, WebViewBuilder, WebViewStyle, Webview};
 pub use openharmony_ability::PdfConfig;
+use openharmony_ability::{
+  native_web::WebProxyBuilder, Either, WebViewBuilder, WebViewStyle, Webview,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// Re-export of `openharmony_ability::Webview` for use in wry's public API.
@@ -28,6 +30,9 @@ pub struct InnerWebView {
   id: String,
   pub(crate) webview: Webview,
   page_loaded: Arc<AtomicBool>,
+  bounds_cache: Mutex<Rect>,
+  is_child: bool,
+  disposed: AtomicBool,
 }
 
 impl InnerWebView {
@@ -36,13 +41,22 @@ impl InnerWebView {
     attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self> {
-    Self::new(_window, attributes, pl_attrs)
+    Self::new_inner(_window, attributes, pl_attrs, true)
   }
 
   pub(crate) fn new(
     window: &impl HasWindowHandle,
     attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
+  ) -> Result<Self> {
+    Self::new_inner(window, attributes, pl_attrs, false)
+  }
+
+  fn new_inner(
+    window: &impl HasWindowHandle,
+    attributes: WebViewAttributes,
+    pl_attrs: super::PlatformSpecificWebViewAttributes,
+    is_child: bool,
   ) -> Result<Self> {
     let WebViewAttributes {
       id,
@@ -65,6 +79,7 @@ impl InnerWebView {
       new_window_req_handler,
       download_started_handler,
       download_completed_handler,
+      bounds,
       ..
     } = attributes;
 
@@ -75,23 +90,40 @@ impl InnerWebView {
       .map(|id| id.to_string())
       .unwrap_or_else(|| COUNTER.next().to_string());
 
-    let background_color =
-      background_color.map(|c| ((c.3 as u32) << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32));
+    let background_color = background_color
+      .map(|c| ((c.3 as u32) << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32));
 
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
 
     let merged_scripts = initialization_scripts
-        .iter()
-        .map(|s| s.script.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
+      .iter()
+      .map(|s| s.script.clone())
+      .collect::<Vec<_>>()
+      .join("\n");
+
+    let initial_bounds = bounds.unwrap_or_default();
+
+    let (style_x, style_y, style_width, style_height) = if is_child && bounds.is_some() {
+      let (x, y) = initial_bounds.position.to_logical::<f64>(1.0).into();
+      let (w, h) = initial_bounds.size.to_logical::<f64>(1.0).into();
+      (
+        Some(Either::A(x)),
+        Some(Either::A(y)),
+        Some(Either::A(w)),
+        Some(Either::A(h)),
+      )
+    } else {
+      (None, None, None, None)
+    };
 
     let mut webview_builder = WebViewBuilder::new()
       .id(id.clone())
       .style(WebViewStyle {
-        x: None,
-        y: None,
+        x: style_x,
+        y: style_y,
+        width: style_width,
+        height: style_height,
         visible: None,
         background_color,
       })
@@ -121,32 +153,33 @@ impl InnerWebView {
 
     // Wire navigation handler (on_navigation → WebViewBuilder::on_navigation_request)
     if let Some(navigation_handler) = navigation_handler {
-      webview_builder = webview_builder.on_navigation_request(move |url: String| -> bool {
-        navigation_handler(url)
-      });
+      webview_builder = webview_builder
+        .on_navigation_request(move |url: String| -> bool { navigation_handler(url) });
     }
 
     // Wire document title changed handler (on_document_title_changed → WebViewBuilder::on_title_change)
     if let Some(document_title_changed_handler) = document_title_changed_handler {
-      webview_builder = webview_builder.on_title_change(move |title: String| {
-        document_title_changed_handler(title)
-      });
+      webview_builder =
+        webview_builder.on_title_change(move |title: String| document_title_changed_handler(title));
     }
 
     // Wire download started handler (FnMut wrapped in Mutex to satisfy Fn bound)
     if let Some(download_started_handler) = download_started_handler {
       let handler = Mutex::new(download_started_handler);
-      webview_builder = webview_builder.on_download_start(move |url: String, path: &mut PathBuf| -> bool {
-        let mut handler = handler.lock().unwrap();
-        handler(url, path)
-      });
+      webview_builder =
+        webview_builder.on_download_start(move |url: String, path: &mut PathBuf| -> bool {
+          let mut handler = handler.lock().unwrap();
+          handler(url, path)
+        });
     }
 
     // Wire download completed handler (Rc<dyn Fn> cloned into closure)
     if let Some(download_completed_handler) = download_completed_handler {
-      webview_builder = webview_builder.on_download_end(move |url: String, path: Option<PathBuf>, success: bool| {
-        download_completed_handler(url, path, success)
-      });
+      webview_builder = webview_builder.on_download_end(
+        move |url: String, path: Option<PathBuf>, success: bool| {
+          download_completed_handler(url, path, success)
+        },
+      );
     }
 
     // Track page loaded state for create_pdf readiness check
@@ -241,7 +274,14 @@ impl InnerWebView {
         .unwrap();
     }
 
-    Ok(Self { id, webview, page_loaded })
+    Ok(Self {
+      id,
+      webview,
+      page_loaded,
+      bounds_cache: Mutex::new(initial_bounds),
+      is_child,
+      disposed: AtomicBool::new(false),
+    })
   }
 
   pub fn print(&self) -> crate::Result<()> {
@@ -288,14 +328,19 @@ impl InnerWebView {
   }
 
   pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
-    log::debug!("[WRY] set_background_color called with RGBA: {:?}", background_color);
+    log::debug!(
+      "[WRY] set_background_color called with RGBA: {:?}",
+      background_color
+    );
     // Convert RGBA(r,g,b,a) to 0xAARRGGBB number format for OHOS
     let color_number = ((background_color.3 as u32) << 24)  // AA (alpha)
                      | ((background_color.0 as u32) << 16)  // RR (red)
                      | ((background_color.1 as u32) << 8)   // GG (green)
-                     | (background_color.2 as u32);          // BB (blue)
+                     | (background_color.2 as u32); // BB (blue)
     log::debug!("[WRY] Converted to u32: 0x{:08X}", color_number);
-    self.webview.set_background_color(color_number)
+    self
+      .webview
+      .set_background_color(color_number)
       .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set background color: {}", e)))
   }
 
@@ -387,15 +432,34 @@ impl InnerWebView {
   }
 
   pub fn bounds(&self) -> Result<Rect> {
-    Ok(Rect::default())
+    Ok(*self.bounds_cache.lock().unwrap())
   }
 
-  pub fn set_bounds(&self, _bounds: Rect) -> Result<()> {
+  pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
+    if !self.is_child {
+      log::debug!("[wry] set_bounds: non-child webview, cache-only update");
+      *self.bounds_cache.lock().unwrap() = bounds;
+      return Ok(());
+    }
+    let (x, y) = bounds.position.to_logical::<f64>(1.0).into();
+    let (w, h) = bounds.size.to_logical::<f64>(1.0).into();
+    self
+      .webview
+      .set_bounds(x, y, w, h)
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set bounds: {}", e)))?;
+    *self.bounds_cache.lock().unwrap() = bounds;
     Ok(())
   }
 
-  pub fn set_visible(&self, _visible: bool) -> Result<()> {
-    Ok(())
+  // set_visible is not gated on is_child because visibility applies to all webviews
+  // (both main and child). The main webview should also support hide/show.
+  // Note: On OHOS, BuilderNode.update() does not re-render .visibility() for Web
+  // components at runtime (ArkUI limitation). This may not produce visual effect.
+  pub fn set_visible(&self, visible: bool) -> Result<()> {
+    self
+      .webview
+      .set_visible(visible)
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set visible: {}", e)))
   }
 
   pub fn focus(&self) -> Result<()> {
@@ -404,6 +468,20 @@ impl InnerWebView {
 
   pub fn focus_parent(&self) -> Result<()> {
     Ok(())
+  }
+
+  pub fn dispose_child(&self) {
+    if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
+      let _ = self.webview.dispose();
+    }
+  }
+}
+
+impl Drop for InnerWebView {
+  fn drop(&mut self) {
+    if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
+      let _ = self.webview.dispose();
+    }
   }
 }
 

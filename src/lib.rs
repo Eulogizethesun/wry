@@ -2534,6 +2534,13 @@ impl WebViewExtOhos for WebView {
   }
 }
 
+#[cfg(target_env = "ohos")]
+impl WebView {
+  pub fn dispose_child(&self) {
+    self.webview.dispose_child();
+  }
+}
+
 /// WebView theme.
 #[derive(Debug, Clone, Copy)]
 pub enum Theme {
