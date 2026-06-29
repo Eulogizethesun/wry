@@ -481,11 +481,14 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
-    if !self.is_child {
-      log::debug!("[wry] set_bounds: non-child webview, cache-only update");
-      *self.bounds_cache.lock().unwrap() = bounds;
-      return Ok(());
-    }
+    // Both child and non-child (main) webviews call ArkTS setBounds, which
+    // triggers updateWebviewStyle → node.update → Web component re-render with
+    // new data.style.width/height/position. The main webview's Web component
+    // is laid out by data.style, so setBounds takes effect for both.
+    // This works because tao propagates ContentRectChange as Resized (so
+    // set_bounds is called on every window resize with the new dimensions),
+    // and WindowIdStore uses or_insert (so the main window's mapping isn't
+    // overwritten by child window creation).
     let (x, y) = bounds.position.to_logical::<f64>(1.0).into();
     let (w, h) = bounds.size.to_logical::<f64>(1.0).into();
     self
