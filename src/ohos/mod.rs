@@ -345,14 +345,46 @@ impl InnerWebView {
   }
 
   pub fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
-    Ok(vec![])
+    // OHOS WebCookieManager has no API to enumerate all cookies across all
+    // URLs. As a best-effort degradation, return cookies for the webview's
+    // current URL (same as `cookies_for_url`). Returns empty when no URL.
+    match self.webview.url() {
+      Ok(url) if !url.is_empty() => self.cookies_for_url(&url),
+      _ => Ok(vec![]),
+    }
   }
 
-  pub fn set_cookie(&self, _cookie: &Cookie<'_>) -> Result<()> {
-    Ok(())
+  pub fn set_cookie(&self, cookie: &Cookie<'_>) -> Result<()> {
+    // OHOS WebCookieManager.configCookieSync requires a URL + a Set-Cookie
+    // formatted value. Derive the URL from the cookie's domain, falling back
+    // to the webview's current URL.
+    let domain = cookie.domain();
+    let url = match domain {
+      Some(d) if !d.is_empty() => format!("https://{}", d.trim_start_matches('.')),
+      _ => match self.webview.url() {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+          log::warn!(
+            "[wry] set_cookie: cannot determine target URL (no domain and no current URL)"
+          );
+          return Ok(());
+        }
+      },
+    };
+
+    let value = format_set_cookie_value(cookie);
+
+    self
+      .webview
+      .set_cookie(url, value)
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to set cookie: {}", e)))
   }
 
   pub fn delete_cookie(&self, _cookie: &Cookie<'_>) -> Result<()> {
+    // OHOS WebCookieManager provides no single-cookie deletion (only
+    // `clearAllCookies` / `clearSessionCookie`). Deleting all cookies here
+    // would be semantically wrong, so this remains a no-op with a warning.
+    log::warn!("[wry] delete_cookie is a no-op on OHOS: platform lacks single-cookie deletion");
     Ok(())
   }
 
@@ -487,4 +519,58 @@ impl Drop for InnerWebView {
 
 pub fn platform_webview_version() -> Result<String> {
   Ok("1.0.0".to_string())
+}
+
+/// Format a `cookie::Cookie` as a Set-Cookie value string (RFC 6265) for
+/// `WebCookieManager.configCookieSync`. Maps the core attributes
+/// (name/value/domain/path/secure/http_only/same_site); other attributes
+/// (e.g. Max-Age/Expires) are intentionally omitted.
+fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
+  let mut value = format!("{}={}", cookie.name(), cookie.value());
+  if let Some(d) = cookie.domain() {
+    value.push_str(&format!("; Domain={}", d));
+  }
+  if let Some(p) = cookie.path() {
+    value.push_str(&format!("; Path={}", p));
+  }
+  if cookie.secure().unwrap_or(false) {
+    value.push_str("; Secure");
+  }
+  if cookie.http_only().unwrap_or(false) {
+    value.push_str("; HttpOnly");
+  }
+  if let Some(same_site) = cookie.same_site() {
+    value.push_str(&format!("; SameSite={}", same_site));
+  }
+  value
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use cookie::SameSite;
+
+  #[test]
+  fn format_set_cookie_value_includes_core_attrs() {
+    let cookie = Cookie::build(("token", "abc"))
+      .domain("example.com")
+      .path("/")
+      .secure(true)
+      .http_only(true)
+      .same_site(SameSite::Lax)
+      .build();
+    let v = format_set_cookie_value(&cookie);
+    assert!(v.starts_with("token=abc"));
+    assert!(v.contains("; Domain=example.com"));
+    assert!(v.contains("; Path=/"));
+    assert!(v.contains("; Secure"));
+    assert!(v.contains("; HttpOnly"));
+    assert!(v.contains("; SameSite=Lax"));
+  }
+
+  #[test]
+  fn format_set_cookie_value_minimal() {
+    let cookie = Cookie::build(("k", "v")).build();
+    assert_eq!(format_set_cookie_value(&cookie), "k=v");
+  }
 }
