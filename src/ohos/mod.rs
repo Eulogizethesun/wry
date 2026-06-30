@@ -309,15 +309,28 @@ impl InnerWebView {
       .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to evaluate script: {}", e)))
   }
 
+  // OHOS has no standalone DevTools window. `open_devtools`/`close_devtools`
+  // toggle `WebviewController.setWebDebuggingAccess` (a process-global static
+  // setter — affecting all webviews) instead. `is_devtools_open` returns the
+  // ArkTS-side tracked state (OHOS has no getter). All three are cfg-gated like
+  // webview2/wkwebview.
   #[cfg(any(debug_assertions, feature = "devtools"))]
-  pub fn open_devtools(&self) {}
+  pub fn open_devtools(&self) {
+    if let Err(e) = self.webview.set_web_debugging_access(true) {
+      log::warn!("[wry] open_devtools failed: {}", e);
+    }
+  }
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
-  pub fn close_devtools(&self) {}
+  pub fn close_devtools(&self) {
+    if let Err(e) = self.webview.set_web_debugging_access(false) {
+      log::warn!("[wry] close_devtools failed: {}", e);
+    }
+  }
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn is_devtools_open(&self) -> bool {
-    false
+    self.webview.is_web_debugging_access().unwrap_or(false)
   }
 
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
@@ -498,8 +511,14 @@ impl InnerWebView {
     self.webview.focus().map_err(|_e| Error::NotMainThread)
   }
 
+  // OHOS has no separate parent window for the webview (the webview is the
+  // window content), so focus_parent focuses the webview itself via requestFocus
+  // — the closest analog to desktop focus_parent which focuses the parent HWND.
   pub fn focus_parent(&self) -> Result<()> {
-    Ok(())
+    self
+      .webview
+      .focus()
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to focus parent: {}", e)))
   }
 
   pub fn dispose_child(&self) {
