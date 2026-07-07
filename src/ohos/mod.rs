@@ -95,6 +95,10 @@ impl InnerWebView {
 
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
+    let use_https = pl_attrs.use_https;
+    if use_https {
+      log::debug!("[WRY OHOS] with_https_scheme(true) enabled — custom protocols will also be registered under 'https' scheme");
+    }
 
     let merged_scripts = initialization_scripts
       .iter()
@@ -213,21 +217,38 @@ impl InnerWebView {
     // Note: this callback runs on the ArkUI JS thread, not the Rust event loop thread.
     if let Some(new_window_req_handler) = new_window_req_handler {
       webview_builder = webview_builder.on_window_new(
-        move |target_url: String, _is_alert: bool, _is_user_trigger: bool| -> bool {
+        move |target_url: String,
+              _is_alert: bool,
+              _is_user_trigger: bool|
+              -> openharmony_ability::OnWindowNewResult {
           let features = crate::NewWindowFeatures {
             size: None,
             position: None,
             opener: crate::NewWindowOpener {},
           };
           match new_window_req_handler(target_url, features) {
-            crate::NewWindowResponse::Allow => true,
+            crate::NewWindowResponse::Allow => {
+              log::debug!("[WRY OHOS] on_window_new: Allow → is_create=false");
+              openharmony_ability::OnWindowNewResult {
+                allow: true,
+                is_create: false,
+              }
+            }
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             crate::NewWindowResponse::Create { .. } => {
-              // OHOS: Create is not supported, degrade to Allow
-              log::warn!("[WRY] NewWindowResponse::Create degraded to Allow on OHOS");
-              true
+              log::debug!("[WRY OHOS] on_window_new: Create → is_create=true");
+              openharmony_ability::OnWindowNewResult {
+                allow: true,
+                is_create: true,
+              }
             }
-            crate::NewWindowResponse::Deny => false,
+            crate::NewWindowResponse::Deny => {
+              log::debug!("[WRY OHOS] on_window_new: Deny → is_create=false");
+              openharmony_ability::OnWindowNewResult {
+                allow: false,
+                is_create: false,
+              }
+            }
           }
         },
       );
@@ -272,6 +293,10 @@ impl InnerWebView {
           (callback)(&webview_id, req, RequestAsyncResponder { responder });
         })
         .unwrap();
+    }
+
+    if use_https {
+      log::warn!("[WRY OHOS] with_https_scheme: https scheme registration not yet implemented — custom protocols use raw scheme. HTTPS origin support requires ArkWeb investigation.");
     }
 
     Ok(Self {
@@ -481,11 +506,14 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
-    if !self.is_child {
-      log::debug!("[wry] set_bounds: non-child webview, cache-only update");
-      *self.bounds_cache.lock().unwrap() = bounds;
-      return Ok(());
-    }
+    // Both child and non-child (main) webviews call ArkTS setBounds, which
+    // triggers updateWebviewStyle → node.update → Web component re-render with
+    // new data.style.width/height/position. The main webview's Web component
+    // is laid out by data.style, so setBounds takes effect for both.
+    // This works because tao propagates ContentRectChange as Resized (so
+    // set_bounds is called on every window resize with the new dimensions),
+    // and WindowIdStore uses or_insert (so the main window's mapping isn't
+    // overwritten by child window creation).
     let (x, y) = bounds.position.to_logical::<f64>(1.0).into();
     let (w, h) = bounds.size.to_logical::<f64>(1.0).into();
     self
