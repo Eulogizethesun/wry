@@ -1936,18 +1936,36 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
 pub struct PlatformSpecificWebViewAttributes {
   /// The OS-level window ID, used to distinguish main (0) vs sub-windows.
   pub window_id: Option<i64>,
+  /// Whether to use `https://` origin for custom protocols (for secure-context support).
+  pub use_https: bool,
 }
 
 #[cfg(target_env = "ohos")]
 pub trait WebViewBuilderExtOhos {
   /// Sets the OS-level window ID for the webview.
   fn with_window_id(self, window_id: i64) -> Self;
+
+  /// Enables HTTPS scheme for custom protocols.
+  ///
+  /// When enabled, custom protocol requests will use `https://` origin
+  /// instead of the raw scheme, allowing secure-context features
+  /// (crypto.subtle, service workers, etc.).
+  ///
+  /// **Note**: On OHOS, this is currently an API surface only — runtime
+  /// HTTPS scheme registration requires ArkWeb investigation. Calling this
+  /// method will log a warning and not change the scheme behavior.
+  fn with_https_scheme(self, enabled: bool) -> Self;
 }
 
 #[cfg(target_env = "ohos")]
 impl WebViewBuilderExtOhos for WebViewBuilder<'_> {
   fn with_window_id(mut self, window_id: i64) -> Self {
     self.platform_specific.window_id = Some(window_id);
+    self
+  }
+
+  fn with_https_scheme(mut self, enabled: bool) -> Self {
+    self.platform_specific.use_https = enabled;
     self
   }
 }
@@ -2188,6 +2206,19 @@ impl WebView {
   /// Clear all browsing data
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
+  }
+
+  /// Create a PDF from the current webview content and save to the given path.
+  ///
+  /// Currently only supported on OpenHarmony.
+  #[cfg(target_env = "ohos")]
+  pub fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    self.webview.create_pdf(path, config, callback)
   }
 
   pub fn bounds(&self) -> Result<Rect> {
@@ -2518,6 +2549,13 @@ pub trait WebViewExtOhos {
 impl WebViewExtOhos for WebView {
   fn webview_handle(&self) -> OhosWebviewHandle {
     self.webview.webview.clone()
+  }
+}
+
+#[cfg(target_env = "ohos")]
+impl WebView {
+  pub fn dispose_child(&self) {
+    self.webview.dispose_child();
   }
 }
 
