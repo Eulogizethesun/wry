@@ -366,7 +366,7 @@ impl InnerWebView {
   }
 
   pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
-    log::debug!(
+    log::info!(
       "[WRY] set_background_color called with RGBA: {:?}",
       background_color
     );
@@ -375,7 +375,7 @@ impl InnerWebView {
                      | ((background_color.0 as u32) << 16)  // RR (red)
                      | ((background_color.1 as u32) << 8)   // GG (green)
                      | (background_color.2 as u32); // BB (blue)
-    log::debug!("[WRY] Converted to u32: 0x{:08X}", color_number);
+    log::info!("[WRY] Converted to u32: 0x{:08X}", color_number);
     self
       .webview
       .set_background_color(color_number)
