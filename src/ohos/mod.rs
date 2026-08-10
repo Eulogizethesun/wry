@@ -1,15 +1,19 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::WebViewAttributes;
-use crate::{Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
+use crate::{custom_protocol_workaround, Error, PageLoadEvent, Rect, RequestAsyncResponder, Result, RGBA};
+use base64::Engine as _;
 use cookie::Cookie;
 use http::{Request, Response, Uri};
 pub use openharmony_ability::PdfConfig;
 use openharmony_ability::{
-  native_web::WebProxyBuilder, Either, WebViewBuilder, WebViewStyle, Webview,
+  native_web::WebProxyBuilder, DragDropEvent as AbilityDragDropEvent, Either, WebViewBuilder,
+  WebViewStyle, Webview,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -80,6 +84,9 @@ impl InnerWebView {
       download_started_handler,
       download_completed_handler,
       bounds,
+      clipboard,
+      zoom_hotkeys_enabled,
+      drag_drop_handler,
       ..
     } = attributes;
 
@@ -96,6 +103,8 @@ impl InnerWebView {
     // Get window_id from platform-specific attributes
     let window_id = pl_attrs.window_id.unwrap_or(0);
     let use_https = pl_attrs.use_https;
+    let drag_drop_overlay = pl_attrs.drag_drop_overlay;
+    log::info!("[WRY OHOS] build: use_https={}, drag_drop_overlay={}, custom_protocols={}", use_https, drag_drop_overlay, custom_protocols.len());
     if use_https {
       log::debug!("[WRY OHOS] with_https_scheme(true) enabled — custom protocols will also be registered under 'https' scheme");
     }
@@ -135,16 +144,75 @@ impl InnerWebView {
       .autoplay(autoplay)
       .initialization_scripts(vec![merged_scripts])
       .transparent(transparent)
+      .clipboard(clipboard)
+      .zoom_hotkeys_enabled(zoom_hotkeys_enabled)
       .window_id(window_id);
+
+    // Wire drag_drop_handler → ArkTS onDragAndDrop. The ETS layer sends
+    // pipe-delimited "<type>|<paths_nul>|<x>,<y>" parsed by
+    // openharmony_ability::DragDropEvent::from_arkts_pipe into a DragDropEvent that
+    // wry maps 1:1. See ohos-webview-drag-drop spec. (drag_and_drop is a feature on
+    // openharmony-ability, not on wry itself; the overlay wiring is OHOS-only.)
+    #[cfg(target_env = "ohos")]
+    {
+      webview_builder = webview_builder.drag_drop_overlay(drag_drop_overlay);
+    }
+    if let Some(handler) = drag_drop_handler {
+      let drag_handler = move |raw: String| {
+        // Invoked synchronously on the JS/NAPI thread by ArkTS `onDragAndDrop`.
+        // The work here (pipe-string parse + handler call) is non-blocking
+        // fire-and-forget by design — no TSFN hop needed (mirrors `on_page_begin`
+        // etc.). Parse the ArkTS pipe-string into an ability DragDropEvent, then
+        // map 1:1 to wry's DragDropEvent. Unrecognized types are dropped (None → return).
+        let event = match AbilityDragDropEvent::from_arkts_pipe(&raw) {
+          Some(AbilityDragDropEvent::Enter { paths, position }) => {
+            crate::DragDropEvent::Enter { paths, position }
+          }
+          Some(AbilityDragDropEvent::Over { position }) => crate::DragDropEvent::Over { position },
+          Some(AbilityDragDropEvent::Drop { paths, position }) => {
+            crate::DragDropEvent::Drop { paths, position }
+          }
+          Some(AbilityDragDropEvent::Leave) => crate::DragDropEvent::Leave,
+          None => return,
+        };
+        // `handler` returns `bool` (handled) on other platforms to feed back into
+        // the OS drag loop. OHOS forwards via a one-way NAPI closure with no
+        // OS-level consume path, so the bool has no meaningful recipient here and
+        // is intentionally discarded.
+        let _ = handler(event);
+      };
+      webview_builder = webview_builder.on_drag_and_drop(drag_handler);
+    }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
     {
       webview_builder = webview_builder.devtools(devtools);
     }
 
+    // When `with_https_scheme(true)` is active AND custom protocols are
+    // registered, tell the ArkTS layer to attach `onInterceptRequest` for the
+    // listed protocols. The actual Rust-side handler is installed after
+    // `build()` via `set_https_intercept_handler`. See openspec
+    // ohos-webview-https-scheme.
+    if use_https && !custom_protocols.is_empty() {
+      let protocol_names: Vec<String> = custom_protocols.keys().cloned().collect();
+      webview_builder = webview_builder
+        .use_https_intercept(true)
+        .https_intercept_protocols(protocol_names);
+    }
+
     if let Some(html) = html {
       webview_builder = webview_builder.html(html);
     } else if let Some(url) = initial_url {
+      // When `with_https_scheme(true)` is active, rewrite the initial URL from
+      // `<protocol>://localhost/<path>` to `https://<protocol>.localhost/<path>`
+      // so the page origin is https (secure context). Only protocols present in
+      // `custom_protocols` are rewritten. See openspec ohos-webview-https-scheme.
+      let url = if use_https && !custom_protocols.is_empty() {
+        rewrite_https_url_if_matching(&url, &custom_protocols)
+      } else {
+        url
+      };
       webview_builder = webview_builder.url(url);
       if let Some(headers) = initial_headers {
         webview_builder = webview_builder.headers(headers);
@@ -282,7 +350,18 @@ impl InnerWebView {
         Error::OpenHarmonyWebviewError(format!("Failed to add controller attach listener: {}", e))
       })?;
 
-    for (protocol, callback) in custom_protocols {
+    // Share each custom-protocol closure between the raw-scheme registration
+    // (custom_protocol_async, kept for backward compat) and the https intercept
+    // handler. `Rc` is safe because everything here lives on the wry event loop
+    // thread (which is the ArkUI JS thread on OHOS).
+    let shared_protocols: HashMap<String, Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder)>> =
+      custom_protocols
+        .into_iter()
+        .map(|(k, v)| (k, Rc::from(v)))
+        .collect();
+    let shared_for_intercept = Rc::new(shared_protocols.clone());
+
+    for (protocol, callback) in shared_protocols {
       let webview_id = id.clone();
       webview
         .custom_protocol_async(protocol, move |_web, req, _is_on_main_frame, responder| {
@@ -290,13 +369,27 @@ impl InnerWebView {
             responder.respond(resp);
           });
 
-          (callback)(&webview_id, req, RequestAsyncResponder { responder });
+          (&*callback)(&webview_id, req, RequestAsyncResponder { responder });
         })
         .unwrap();
     }
 
-    if use_https {
-      log::warn!("[WRY OHOS] with_https_scheme: https scheme registration not yet implemented — custom protocols use raw scheme. HTTPS origin support requires ArkWeb investigation.");
+    // Install the https intercept handler. When ArkTS `onInterceptRequest`
+    // matches `https://<protocol>.localhost/<path>`, it calls the
+    // `dispatch_https_intercept` NAPI function which invokes this closure. The
+    // closure reverts the URL, finds the matching custom_protocol closure,
+    // invokes it synchronously over a blocking mpsc channel (Phase 1
+    // simplified threading), and serializes the response to JSON:
+    // `{"status":u16,"mimeType":String,"body":"base64..."}`.
+    if use_https && !shared_for_intercept.is_empty() {
+      let intercept_map = shared_for_intercept.clone();
+      let intercept_webview_id = id.clone();
+      let handler: Box<dyn Fn(String) -> Option<String>> = Box::new(move |url: String| {
+        dispatch_https_intercept_sync(&url, &intercept_map, &intercept_webview_id)
+      });
+      if let Err(e) = webview.set_https_intercept_handler(handler) {
+        log::warn!("[WRY OHOS] set_https_intercept_handler failed: {}", e);
+      }
     }
 
     Ok(Self {
@@ -310,7 +403,24 @@ impl InnerWebView {
   }
 
   pub fn print(&self) -> crate::Result<()> {
-    Ok(())
+    // Generate a temp PDF, then delegate to ArkTS `print(path)` which invokes
+    // @ohos.print. See ohos-webview-print spec.
+    if !self.page_loaded.load(Ordering::SeqCst) {
+      return Err(Error::OpenHarmonyWebviewError(
+        "Page not fully loaded. Call print after onPageEnd.".into(),
+      ));
+    }
+    let temp_path = std::env::temp_dir().join(format!(
+      "wry_print_{}.pdf",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+    ));
+    self
+      .webview
+      .print(temp_path.to_string_lossy().to_string())
+      .map_err(|e| Error::OpenHarmonyWebviewError(format!("Failed to print: {}", e)))
   }
 
   pub fn id(&self) -> crate::WebViewId<'_> {
@@ -566,6 +676,95 @@ impl Drop for InnerWebView {
 
 pub fn platform_webview_version() -> Result<String> {
   Ok("1.0.0".to_string())
+}
+
+/// Rewrite `<protocol>://localhost/<path>` to `https://<protocol>.localhost/<path>`
+/// when the URL's scheme matches one of `custom_protocols`' keys. Used when
+/// `with_https_scheme(true)` is active so the page origin becomes https.
+/// Non-matching URLs (e.g. `https://example.com/...`) are returned unchanged.
+fn rewrite_https_url_if_matching(
+  url: &str,
+  custom_protocols: &HashMap<String, Box<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder)>>,
+) -> String {
+  for protocol in custom_protocols.keys() {
+    let original_prefix = format!("{}://", protocol);
+    if url.starts_with(&original_prefix) {
+      return custom_protocol_workaround::apply_uri_work_around(url, "https", protocol);
+    }
+  }
+  url.to_string()
+}
+
+/// Synchronous https-intercept dispatch. Called from the closure installed via
+/// `Webview::set_https_intercept_handler` (which itself is invoked by the
+/// `dispatch_https_intercept` NAPI function from ArkTS `onInterceptRequest`).
+///
+/// 1. Find the protocol whose `https://<protocol>.localhost/...` form matches
+///    `url` and revert it to `<protocol>://localhost/...`.
+/// 2. Build a GET `Request<Vec<u8>>` (Phase 1: method/headers not forwarded).
+/// 3. Invoke the matching `custom_protocol` closure with a blocking mpsc
+///    channel as the responder (Phase 1 simplified threading).
+/// 4. Serialize the response to JSON `{"status":u16,"mimeType":String,"body":"<base64>"}`.
+fn dispatch_https_intercept_sync(
+  url: &str,
+  protocols: &HashMap<String, Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder)>>,
+  webview_id: &str,
+) -> Option<String> {
+  // Find matching protocol + reverted URL.
+  let mut matched: Option<(String, String)> = None;
+  for protocol in protocols.keys() {
+    if custom_protocol_workaround::is_work_around_uri(url, "https", protocol) {
+      let reverted = custom_protocol_workaround::revert_uri_work_around(url, "https", protocol);
+      matched = Some((protocol.clone(), reverted));
+      break;
+    }
+  }
+  let (_protocol, reverted_url) = matched?;
+  let callback = protocols.get(&_protocol)?;
+  let request = Request::builder()
+    .method("GET")
+    .uri(&reverted_url)
+    .body(Vec::new())
+    .ok()?;
+
+  // Blocking channel: the custom_protocol closure invokes the responder
+  // (possibly from another thread) which sends the response back.
+  // Timeout protects the ArkUI JS thread: if a protocol closure never calls
+  // the responder (bug/panic), we fall back to ArkWeb's default network stack
+  // instead of hanging the UI forever. See ohos-webview-https-scheme spec
+  // (Phase 1 synchronous dispatch).
+  let (tx, rx) = std::sync::mpsc::channel::<Response<Cow<'static, [u8]>>>();
+  let responder: Box<dyn FnOnce(Response<Cow<'static, [u8]>>)> = Box::new(move |resp| {
+    let _ = tx.send(resp);
+  });
+  (&**callback)(webview_id, request, RequestAsyncResponder { responder });
+
+  // Timeout must be well below the OHOS ANR threshold (~5s). Local asset
+  // loading typically completes in <1ms; 3s gives ample headroom for heavier
+  // handlers while avoiding THREAD_BLOCK appfreeze. See ohos-constraints §1.2.
+  let response = rx
+    .recv_timeout(std::time::Duration::from_secs(3))
+    .ok()?;
+
+  let status = response.status().as_u16();
+  let mime = response
+    .headers()
+    .get("content-type")
+    .and_then(|v| v.to_str().ok())
+    .unwrap_or("application/octet-stream")
+    .to_string();
+  let body = response.body();
+  let body_bytes: &[u8] = match body {
+    Cow::Borrowed(b) => b,
+    Cow::Owned(v) => v.as_slice(),
+  };
+  let body_b64 = base64::engine::general_purpose::STANDARD.encode(body_bytes);
+  // Minimal JSON string escaping for the mimeType (body is base64 — safe).
+  let mime_escaped = mime.replace('\\', "\\\\").replace('"', "\\\"");
+  Some(format!(
+    r#"{{"status":{},"mimeType":"{}","body":"{}"}}"#,
+    status, mime_escaped, body_b64
+  ))
 }
 
 /// Format a `cookie::Cookie` as a Set-Cookie value string (RFC 6265) for

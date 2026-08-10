@@ -347,7 +347,7 @@
 // #[macro_use]
 // extern crate objc;
 
-#[cfg(any(target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "windows", target_os = "android", target_env = "ohos"))]
 mod custom_protocol_workaround;
 mod error;
 #[cfg(any(target_os = "android", test))]
@@ -1938,6 +1938,9 @@ pub struct PlatformSpecificWebViewAttributes {
   pub window_id: Option<i64>,
   /// Whether to use `https://` origin for custom protocols (for secure-context support).
   pub use_https: bool,
+  /// Enable transparent overlay for drag-drop when ArkWeb doesn't bubble OS file drag events.
+  /// See openspec ohos-webview-drag-drop-overlay.
+  pub drag_drop_overlay: bool,
 }
 
 #[cfg(target_env = "ohos")]
@@ -1955,6 +1958,11 @@ pub trait WebViewBuilderExtOhos {
   /// HTTPS scheme registration requires ArkWeb investigation. Calling this
   /// method will log a warning and not change the scheme behavior.
   fn with_https_scheme(self, enabled: bool) -> Self;
+
+  /// Enable transparent drag-drop overlay for OHOS.
+  /// When ArkWeb doesn't bubble OS file drag events to ArkUI, this overlay
+  /// receives drag events and forwards them to drag_drop_handler.
+  fn with_drag_drop_overlay(self, enabled: bool) -> Self;
 }
 
 #[cfg(target_env = "ohos")]
@@ -1966,6 +1974,11 @@ impl WebViewBuilderExtOhos for WebViewBuilder<'_> {
 
   fn with_https_scheme(mut self, enabled: bool) -> Self {
     self.platform_specific.use_https = enabled;
+    self
+  }
+
+  fn with_drag_drop_overlay(mut self, enabled: bool) -> Self {
+    self.platform_specific.drag_drop_overlay = enabled;
     self
   }
 }
