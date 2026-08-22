@@ -205,13 +205,16 @@ dom_query = { version = "0.27.0", default-features = false }
 [target.'cfg(target_env = "ohos")'.dependencies]
 openharmony-ability = { path = "../openharmony-ability/crates/ability" }
 openharmony-ability-derive = { path = "../openharmony-ability/crates/derive" }
+openharmony-ability-plugin-webview = { path = "../openharmony-ability/crates/plugin-webview" }
+tokio = { version = "1", features = ["rt"] }
 log = "0.4"
+base64 = "0.22"
+# inject_initialization_scripts module (cfg(any(android, test))) uses dom_query
+dom_query = { version = "0.27.0", default-features = false }
+sha2 = "0.10"
 
 [dev-dependencies]
 pollster = "0.4.0"
-tao = "0.35"
-wgpu = "23"
-winit = "0.30"
 getrandom = "0.3"
 http-range = "0.1"
 percent-encoding = "2.3"
@@ -221,7 +224,14 @@ libloading = "0.8.9"
 sha2 = "0.10"
 base64 = "0.22"
 dom_query = { version = "0.27.0", default-features = false }
-log = "0.4"
+
+# tao/winit/wgpu pull in GTK/glib on Linux which has no pkg-config for OHOS.
+# They are only used in doc-comment examples, not in actual #[cfg(test)] code,
+# so gate them to non-OHOS to allow OHOS test cross-compilation.
+[target.'cfg(not(target_env = "ohos"))'.dev-dependencies]
+tao = "0.35"
+wgpu = "23"
+winit = "0.30"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
