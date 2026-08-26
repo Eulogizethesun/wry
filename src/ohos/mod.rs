@@ -1333,4 +1333,78 @@ mod tests {
     let v = format_set_cookie_value(&cookie);
     assert!(v.contains("; SameSite=None"));
   }
+
+  // ─── S7 纯变换批：dispatch_https_intercept_sync 的各分支 ─────────────────────
+
+  fn https_test_handler(
+    respond_inline: bool,
+  ) -> HashMap<String, SharedProtocolHandler> {
+    let mut m: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    let handler: ProtocolHandler = Box::new(move |_id, _req, responder| {
+      if respond_inline {
+        let resp = http::Response::builder()
+          .status(201)
+          .header("content-type", "application/json")
+          .body(Vec::new())
+          .unwrap();
+        responder.respond(resp);
+      }
+      // respond_inline=false → 永不回应 → 走 3s 超时分支
+    });
+    m.insert("myproto".into(), Arc::new(SendSyncBox(handler)));
+    m
+  }
+
+  #[test]
+  fn https_intercept_non_https_url_passthrough() {
+    let resp = dispatch_https_intercept_sync("http://x.localhost/p", "w1", &HashMap::new());
+    assert!(!resp.handled && resp.status == 0);
+  }
+
+  #[test]
+  fn https_intercept_unregistered_protocol_passthrough() {
+    let resp = dispatch_https_intercept_sync(
+      "https://unknown.localhost/p",
+      "w1",
+      &https_test_handler(true),
+    );
+    assert!(!resp.handled && resp.status == 0);
+  }
+
+  #[test]
+  fn https_intercept_invalid_uri_passthrough() {
+    // 协议已注册，但还原后的 URI 含空格 → Request::builder 失败 → passthrough
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/a b",
+      "w1",
+      &https_test_handler(true),
+    );
+    assert!(!resp.handled && resp.status == 0);
+  }
+
+  #[test]
+  fn https_intercept_inline_response_is_handled() {
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/data",
+      "w1",
+      &https_test_handler(true),
+    );
+    assert!(resp.handled);
+    assert_eq!(resp.status, 201);
+    assert_eq!(resp.mime_type, "application/json");
+  }
+
+  #[test]
+  fn https_intercept_unanswered_handler_returns_early_via_disconnect() {
+    // handler 持有的 responder（含 tx）drop → recv_timeout 立即 Err(Disconnected)
+    // → 同一 Err(_) 分支 → passthrough（无需真等 3s 超时）
+    let start = std::time::Instant::now();
+    let resp = dispatch_https_intercept_sync(
+      "https://myproto.localhost/slow",
+      "w1",
+      &https_test_handler(false),
+    );
+    assert!(!resp.handled && resp.status == 0);
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+  }
 }
