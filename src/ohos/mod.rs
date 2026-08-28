@@ -638,7 +638,9 @@ impl InnerWebView {
       create_req = create_req.html(html);
     } else if let Some(url) = initial_url {
       let url = if use_https && !shared_for_intercept.is_empty() {
-        rewrite_https_url_if_matching(&url, &shared_for_intercept)
+        let rewritten = rewrite_https_url_if_matching(&url, &shared_for_intercept);
+        log::info!("[wry https-intercept] URL rewrite: {} → {} (use_https={}, protocols={:?})", url, rewritten, use_https, shared_for_intercept.keys().collect::<Vec<_>>());
+        rewritten
       } else {
         url
       };
@@ -1053,26 +1055,46 @@ pub fn platform_webview_version() -> Result<String> {
 ///
 /// The URL has the form `https://<protocol>.localhost/<path>`. This function extracts the
 /// protocol name, reverts the URL to `<protocol>://localhost/<path>`, builds a `Request`,
-/// and calls the handler with a `RequestAsyncResponder` that sends the response through
-/// an mpsc channel. The main thread blocks on `recv_timeout(3s)`.
+/// and calls the handler with a `RequestAsyncResponder`.
 ///
-/// **Note**: This runs on the NAPI main thread via `invokeNativeSync`, which is a
-/// synchronous call path distinct from TSFN. Blocking here does NOT cause TSFN deadlock
-/// because no TSFN call is pending.
+/// **Threading model**: This runs on the NAPI main thread via `invokeNativeSync`. The handler
+/// is expected to call the responder **synchronously** (inline) — the default tauri asset handler
+/// (`tauri::protocol::tauri::get`) does exactly this: it calls `get_response()` then
+/// `responder.respond()` before returning.
+///
+/// We use an `Arc<Mutex<Option<Response>>>` instead of `mpsc::channel + rx.recv_timeout()`.
+/// The previous `rx.recv_timeout(3s)` blocked the NAPI main thread, violating the design doc
+/// (`p2-bridge-https-intercept/design.md:369`: "无 `run_on_main_thread + rx.recv()` 阻塞模式")
+/// and risking deadlock if any handler dispatched its responder via `run_on_main_thread`.
+///
+/// If the handler does NOT call the responder synchronously (returns before responding),
+/// we return `passthrough()` immediately — no blocking. This is a safe degradation: the
+/// ArkWeb default network stack handles the request (which will fail for `tauri.localhost`
+/// since it's not a real domain, but this only happens for async handlers, which the default
+/// tauri handler is not). A warning is logged so the issue is visible.
 fn dispatch_https_intercept_sync(
   url: &str,
   webview_id: &str,
   protocols: &HashMap<String, SharedProtocolHandler>,
 ) -> WebviewHttpsInterceptResponse {
+  log::info!("[wry https-intercept] enter: url={} webview_id={}", url, webview_id);
+
   // Extract protocol name from `https://<protocol>.localhost/...`
   let protocol = match extract_protocol_from_https_url(url) {
     Some(p) => p,
-    None => return WebviewHttpsInterceptResponse::passthrough(),
+    None => {
+      log::info!("[wry https-intercept] passthrough: no protocol extracted from url={}", url);
+      return WebviewHttpsInterceptResponse::passthrough();
+    }
   };
+  log::info!("[wry https-intercept] extracted protocol='{}' from url={}", protocol, url);
 
   let callback = match protocols.get(protocol) {
     Some(c) => Arc::clone(c),
-    None => return WebviewHttpsInterceptResponse::passthrough(),
+    None => {
+      log::warn!("[wry https-intercept] passthrough: protocol '{}' not in registered set ({} protocols registered)", protocol, protocols.len());
+      return WebviewHttpsInterceptResponse::passthrough();
+    }
   };
 
   // Revert URL: `https://<protocol>.localhost/<path>` → `<protocol>://localhost/<path>`
@@ -1081,27 +1103,43 @@ fn dispatch_https_intercept_sync(
     &format!("{}://", protocol),
     1,
   );
+  log::info!("[wry https-intercept] reverted url: {} → {}", url, original_url);
 
   let request = match Request::builder().uri(&original_url).body(Vec::new()) {
     Ok(r) => r,
-    Err(_) => return WebviewHttpsInterceptResponse::passthrough(),
+    Err(e) => {
+      log::warn!("[wry https-intercept] passthrough: failed to build request for {}: {}", original_url, e);
+      return WebviewHttpsInterceptResponse::passthrough();
+    }
   };
 
-  // Use a channel to synchronously get the response
-  let (tx, rx) = mpsc::channel::<Response<Cow<'static, [u8]>>>();
+  // Non-blocking response cell: the handler is expected to call the responder
+  // synchronously (before returning). We check immediately after the call — no
+  // recv_timeout, no main-thread blocking.
+  let response_cell: Arc<Mutex<Option<Response<Cow<'static, [u8]>>>>> =
+    Arc::new(Mutex::new(None));
+  let response_cell_clone = Arc::clone(&response_cell);
 
   let responder: Box<dyn FnOnce(Response<Cow<'static, [u8]>>)> = Box::new(move |resp| {
-    let _ = tx.send(resp);
+    *response_cell_clone.lock().unwrap() = Some(resp);
   });
 
+  log::info!("[wry https-intercept] calling protocol handler for protocol='{}'...", protocol);
   (callback.0)(
     webview_id,
     request,
     RequestAsyncResponder { responder },
   );
+  log::info!("[wry https-intercept] protocol handler returned for protocol='{}'", protocol);
 
-  match rx.recv_timeout(std::time::Duration::from_secs(3)) {
-    Ok(response) => {
+  // Check if the handler called the responder synchronously (inline).
+  // This is the expected path for the default tauri asset handler.
+  // NOTE: bind the Option to a local so the MutexGuard (from `.lock().unwrap()`)
+  // drops before the end of the block — otherwise the guard's temporary borrow
+  // outlives `response_cell` and trips E0597.
+  let maybe_response = response_cell.lock().unwrap().take();
+  match maybe_response {
+    Some(response) => {
       let status = response.status().as_u16();
       let mime_type = response
         .headers()
@@ -1110,6 +1148,10 @@ fn dispatch_https_intercept_sync(
         .unwrap_or("text/html")
         .to_string();
       let body = response.body().to_vec();
+      log::info!(
+        "[wry https-intercept] success: protocol='{}' status={} mime={} body_len={}",
+        protocol, status, mime_type, body.len()
+      );
       WebviewHttpsInterceptResponse {
         handled: true,
         status,
@@ -1117,8 +1159,18 @@ fn dispatch_https_intercept_sync(
         body,
       }
     }
-    Err(_) => {
-      log::warn!("[wry] https intercept timed out for: {}", url);
+    None => {
+      // The handler did not call the responder synchronously. This means either:
+      // 1. The handler is genuinely async (spawns a thread, calls responder later)
+      // 2. The handler encountered an internal error and forgot to call the responder
+      //
+      // We CANNOT block here (design.md:369 prohibits rx.recv on main thread).
+      // Return passthrough — ArkWeb will attempt a real fetch of https://tauri.localhost
+      // which will fail (not a real domain), but this is the safest non-blocking option.
+      log::warn!(
+        "[wry https-intercept] handler did not respond synchronously for protocol='{}' url={} — returning passthrough (no blocking)",
+        protocol, url
+      );
       WebviewHttpsInterceptResponse::passthrough()
     }
   }
@@ -1349,7 +1401,8 @@ mod tests {
           .unwrap();
         responder.respond(resp);
       }
-      // respond_inline=false → 永不回应 → 走 3s 超时分支
+      // respond_inline=false → handler returns without calling responder
+      // → non-blocking check finds None → passthrough (no 3s wait)
     });
     m.insert("myproto".into(), Arc::new(SendSyncBox(handler)));
     m
@@ -1396,8 +1449,8 @@ mod tests {
 
   #[test]
   fn https_intercept_unanswered_handler_returns_early_via_disconnect() {
-    // handler 持有的 responder（含 tx）drop → recv_timeout 立即 Err(Disconnected)
-    // → 同一 Err(_) 分支 → passthrough（无需真等 3s 超时）
+    // handler returns without calling responder → response_cell is None
+    // → non-blocking passthrough (no recv_timeout, no 3s wait)
     let start = std::time::Instant::now();
     let resp = dispatch_https_intercept_sync(
       "https://myproto.localhost/slow",
