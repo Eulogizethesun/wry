@@ -722,6 +722,10 @@ struct WebViewAttributes<'a> {
   ///
   /// macOS doesn't provide such method and is always enabled by default. But your app will still need to add menu
   /// item accelerators to use the clipboard shortcuts.
+  ///
+  /// **OHOS** defaults to `true` (ArkWeb native clipboard shortcuts, matching
+  /// macOS/Windows keyboard behavior); setting `false` intercepts keyboard
+  /// Ctrl+C/X/V/A/Z/Y via onKeyPreIme. See the ohos-webview-flag-clipboard spec.
   pub clipboard: bool,
 
   /// Enable web inspector which is usually called browser devtools.
@@ -849,7 +853,11 @@ impl Default for WebViewAttributes<'_> {
       download_started_handler: Some(Box::new(|_, _| true)),
       download_completed_handler: None,
       new_window_req_handler: None,
-      clipboard: false,
+      // OHOS defaults to enabled (ArkWeb native clipboard shortcuts) so that
+      // default-configured webviews keep working Ctrl+C like Windows/macOS.
+      // Other platforms keep the historical `false` default. See
+      // ohos-webview-flag-clipboard spec.
+      clipboard: cfg!(target_env = "ohos"),
       #[cfg(debug_assertions)]
       devtools: true,
       #[cfg(not(debug_assertions))]
@@ -1327,6 +1335,9 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// macOS doesn't provide such method and is always enabled by default. But your app will still need to add menu
   /// item accelerators to use the clipboard shortcuts.
+  ///
+  /// **OHOS** defaults to `true` (ArkWeb native clipboard shortcuts); setting `false` intercepts keyboard
+  /// Ctrl+C/X/V/A/Z/Y via onKeyPreIme. See the ohos-webview-flag-clipboard spec.
   pub fn with_clipboard(mut self, clipboard: bool) -> Self {
     self.attrs.clipboard = clipboard;
     self
