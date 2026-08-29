@@ -13,7 +13,7 @@ use http::{Request, Response, Uri};
 use openharmony_ability_plugin_webview::{
   Either, WebviewCallbacksBuilder, WebviewClient, WebviewCreateRequest,
   WebviewDownloadStartResponse, WebviewHandle, WebviewHttpsInterceptResponse,
-  WebviewInitializationScript, WebviewJavascriptProxyBuilder, WebviewProtocol,
+  WebviewInitializationScript, WebviewJavascriptProxyBuilder, WebviewPdfConfig, WebviewProtocol,
   WebviewProtocolOptions, WebviewStyle,
 };
 
@@ -123,7 +123,7 @@ enum PendingOp {
   SetCookie(String, String),
   Print(String),
   Eval(String, Option<Box<dyn Fn(String) + Send + 'static>>),
-  CreatePdf(String, Option<Box<dyn Fn(bool) + Send + 'static>>),
+  CreatePdf(String, Option<WebviewPdfConfig>, Option<Box<dyn Fn(bool) + Send + 'static>>),
   Remove,
 }
 
@@ -186,7 +186,7 @@ impl PendingOp {
         }
       }
       PendingOp::Print(path) => {
-        if let Err(e) = handle.create_pdf(&path).await {
+        if let Err(e) = handle.create_pdf(&path, None).await {
           log::warn!("[wry] pending create_pdf failed: {}", e);
         } else if let Err(e) = handle.print(&path).await {
           log::warn!("[wry] pending print failed: {}", e);
@@ -202,8 +202,8 @@ impl PendingOp {
           Err(e) => log::warn!("[wry] pending evaluate_script failed: {}", e),
         }
       }
-      PendingOp::CreatePdf(path, callback) => {
-        let result = handle.create_pdf(&path).await;
+      PendingOp::CreatePdf(path, config, callback) => {
+        let result = handle.create_pdf(&path, config).await;
         let success = result.is_ok();
         if let Some(cb) = callback {
           cb(success);
@@ -977,7 +977,7 @@ impl InnerWebView {
   pub fn create_pdf(
     &self,
     path: &str,
-    _config: Option<PdfConfig>,
+    config: Option<PdfConfig>,
     callback: Box<dyn Fn(bool) + Send + 'static>,
   ) -> Result<()> {
     if !self.page_loaded.load(Ordering::SeqCst) {
@@ -986,7 +986,19 @@ impl InnerWebView {
         "Page not fully loaded. Call createPdf after onPageEnd.".into(),
       ));
     }
-    self.dispatch_or_queue(PendingOp::CreatePdf(path.to_string(), Some(callback)));
+    // Forward the caller-supplied layout to the bridge; when `None` the ArkTS
+    // side applies its fixed A4 defaults.
+    let pdf_config = config.map(|c| WebviewPdfConfig {
+      width: c.width,
+      height: c.height,
+      margin_top: c.margin_top,
+      margin_bottom: c.margin_bottom,
+      margin_left: c.margin_left,
+      margin_right: c.margin_right,
+      scale: c.scale,
+      should_print_background: c.should_print_background,
+    });
+    self.dispatch_or_queue(PendingOp::CreatePdf(path.to_string(), pdf_config, Some(callback)));
     Ok(())
   }
 
