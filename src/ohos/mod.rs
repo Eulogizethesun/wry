@@ -77,6 +77,19 @@ pub(crate) struct BridgeExecutor {
 
 impl BridgeExecutor {
   fn new() -> Self {
+    // Shared across all webviews: one background thread + runtime for the whole
+    // process, instead of one per webview (each InnerWebView used to spawn its
+    // own `ohos-wry-bridge-rt` thread). `BridgeExecutor` is `Clone` and the
+    // underlying handle is thread-safe, so all webviews multiplex the same
+    // runtime. `main_thread_id` is captured on first construction, which is the
+    // app's main thread (webviews are created from it or after it exists).
+    static SHARED: OnceLock<BridgeExecutor> = OnceLock::new();
+    SHARED
+      .get_or_init(|| Self::new_exclusive())
+      .clone()
+  }
+
+  fn new_exclusive() -> Self {
     let runtime = tokio::runtime::Builder::new_current_thread()
       .enable_all()
       .build()
@@ -234,6 +247,10 @@ pub struct InnerWebView {
   handle: Arc<OnceLock<WebviewHandle>>,
   /// Operations queued before create completes. Also serves as the TOCTOU guard lock.
   pending_ops: Arc<Mutex<Vec<PendingOp>>>,
+  /// Set when `WebviewClient::create()` fails. Once set, `dispatch_or_queue`
+  /// returns an error instead of queueing ops that would never be replayed.
+  /// Guarded by the `pending_ops` lock (set and read while holding it).
+  creation_error: Arc<Mutex<Option<String>>>,
   /// For constructing handles before create completes (used by webview_handle()).
   client: WebviewClient,
   runtime: BridgeExecutor,
@@ -570,8 +587,9 @@ impl InnerWebView {
     //     rewrite used when `use_https` is enabled.
     //   * `"{scheme}://"` — matches custom-protocol origins (e.g. `tauri://`),
     //     which `"*"` does NOT match on ArkWeb: custom protocols require a
-    //     scheme-prefixed rule ending in `://` (see openharmony-ability
-    //     `多窗口特性实现文档.md` TODO-5). One rule per registered custom scheme.
+    //     scheme-prefixed rule ending in `://` (see the openharmony-ability
+    //     multi-window design doc, `多窗口特性实现文档.md`, TODO-5). One rule
+    //     per registered custom scheme.
     // The raw-scheme default (`tauri://localhost`) is the tauri default
     // (`useHttpsScheme` is false unless a consumer opts in), so the
     // scheme-prefixed rule is essential.
@@ -587,8 +605,9 @@ impl InnerWebView {
     //
     // ArkWeb's `javaScriptOnDocumentStart` executes `ScriptItem[]` in
     // **dictionary (lexicographic) order, NOT array order** (ArkWeb docs:
-    // "该脚本按照字典序执行，非数组本身顺序，若需数组本身顺序，建议使用
-    // runJavaScriptOnDocumentStart 接口"). Tauri's init scripts are an
+    // "scripts run in dictionary order rather than array order; use
+    // runJavaScriptOnDocumentStart if array order is required"). Tauri's init
+    // scripts are an
     // ordered dependency chain (create `window.__TAURI_INTERNALS__` →
     // ipc-protocol → metadata → init/core.js). Registering them as separate
     // ScriptItems lets ArkWeb reorder them by script-content lexicographically:
@@ -697,10 +716,12 @@ impl InnerWebView {
     // 6. Spawn create on BridgeExecutor (delayed attach)
     let handle_slot: Arc<OnceLock<WebviewHandle>> = Arc::new(OnceLock::new());
     let pending_ops: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+    let creation_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let client_for_create = client.clone();
     let handle_slot_for_create = handle_slot.clone();
     let pending_ops_for_create = pending_ops.clone();
+    let creation_error_for_create = creation_error.clone();
     let runtime_for_create = runtime.clone();
 
     runtime.spawn(async move {
@@ -727,7 +748,16 @@ impl InnerWebView {
           });
         }
         Err(e) => {
-          log::error!("[wry] WebviewClient::create() failed: {}", e);
+          // Surface the failure to callers: ops dispatched after a failed
+          // create would otherwise queue forever with no replay trigger.
+          // Hold the pending_ops lock (same TOCTOU guard as the Ok branch)
+          // so `dispatch_or_queue` never races between the two states.
+          let error_str = e.to_string();
+          log::error!("[wry] WebviewClient::create() failed: {}", error_str);
+          let mut guard = pending_ops_for_create.lock().unwrap();
+          *creation_error_for_create.lock().unwrap() = Some(error_str);
+          // Queued ops can never execute — drop them.
+          guard.clear();
         }
       }
     });
@@ -751,6 +781,7 @@ impl InnerWebView {
       id,
       handle: handle_slot,
       pending_ops,
+      creation_error,
       client,
       runtime,
       page_loaded,
@@ -766,7 +797,9 @@ impl InnerWebView {
 
   /// Execute a PendingOp immediately if the handle is ready, otherwise queue it.
   /// **TOCTOU guard**: must hold `pending_ops` lock when checking `handle.get()`.
-  fn dispatch_or_queue(&self, op: PendingOp) {
+  /// Returns an error if webview creation already failed — the op is dropped
+  /// rather than queued forever.
+  fn dispatch_or_queue(&self, op: PendingOp) -> Result<()> {
     let mut guard = self.pending_ops.lock().unwrap();
     if let Some(handle) = self.handle.get() {
       // Handle is ready — release lock and spawn
@@ -775,9 +808,16 @@ impl InnerWebView {
       self.runtime.spawn(async move {
         op.execute(&handle).await;
       });
+      Ok(())
+    } else if let Some(err) = self.creation_error.lock().unwrap().as_ref() {
+      Err(Error::OpenHarmonyWebviewError(format!(
+        "webview creation failed: {}",
+        err
+      )))
     } else {
       // Not ready — queue for replay after create
       guard.push(op);
+      Ok(())
     }
   }
 
@@ -802,7 +842,7 @@ impl InnerWebView {
         .unwrap_or(0)
     ));
     let path_str = temp_path.to_string_lossy().to_string();
-    self.dispatch_or_queue(PendingOp::Print(path_str));
+    self.dispatch_or_queue(PendingOp::Print(path_str))?;
     Ok(())
   }
 
@@ -823,7 +863,7 @@ impl InnerWebView {
   ) -> Result<()> {
     let js = js.to_string();
     let cb = callback.map(|c| Box::new(c) as Box<dyn Fn(String) + Send + 'static>);
-    self.dispatch_or_queue(PendingOp::Eval(js, cb));
+    self.dispatch_or_queue(PendingOp::Eval(js, cb))?;
     Ok(())
   }
 
@@ -859,7 +899,7 @@ impl InnerWebView {
 
   // Pattern A: fire-and-forget
   pub fn zoom(&self, scale_factor: f64) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::Zoom(scale_factor));
+    self.dispatch_or_queue(PendingOp::Zoom(scale_factor))?;
     Ok(())
   }
 
@@ -868,7 +908,7 @@ impl InnerWebView {
       "#{:02X}{:02X}{:02X}{:02X}",
       background_color.3, background_color.0, background_color.1, background_color.2
     );
-    self.dispatch_or_queue(PendingOp::SetBackgroundColor(color_str));
+    self.dispatch_or_queue(PendingOp::SetBackgroundColor(color_str))?;
     Ok(())
   }
 
@@ -898,7 +938,7 @@ impl InnerWebView {
       }
     };
     let value = format_set_cookie_value(cookie);
-    self.dispatch_or_queue(PendingOp::SetCookie(url, value));
+    self.dispatch_or_queue(PendingOp::SetCookie(url, value))?;
     Ok(())
   }
 
@@ -925,6 +965,10 @@ impl InnerWebView {
       let _ = tx.send(result.unwrap_or_default());
     });
     let cookie_str = rx
+      // Safe to block here: the main-thread guard above guarantees we are on
+      // a worker thread, so the TSFN callback (which runs on the main thread)
+      // can complete while we wait. This is the "blocking-from-worker"
+      // pattern; the forbidden variant is blocking the MAIN thread.
       .recv_timeout(std::time::Duration::from_secs(3))
       .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?;
     let cookies_data: Vec<Cookie<'static>> = cookie_str
@@ -942,12 +986,12 @@ impl InnerWebView {
 
   // Pattern A: fire-and-forget
   pub fn reload(&self) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::Reload);
+    self.dispatch_or_queue(PendingOp::Reload)?;
     Ok(())
   }
 
   pub fn load_url(&self, url: &str) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::LoadUrl(url.to_string()));
+    self.dispatch_or_queue(PendingOp::LoadUrl(url.to_string()))?;
     Ok(())
   }
 
@@ -959,17 +1003,17 @@ impl InnerWebView {
     self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(
       url.to_string(),
       header_map,
-    ));
+    ))?;
     Ok(())
   }
 
   pub fn load_html(&self, html: &str) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::LoadHtml(html.to_string()));
+    self.dispatch_or_queue(PendingOp::LoadHtml(html.to_string()))?;
     Ok(())
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::ClearAllBrowsingData);
+    self.dispatch_or_queue(PendingOp::ClearAllBrowsingData)?;
     Ok(())
   }
 
@@ -998,7 +1042,7 @@ impl InnerWebView {
       scale: c.scale,
       should_print_background: c.should_print_background,
     });
-    self.dispatch_or_queue(PendingOp::CreatePdf(path.to_string(), pdf_config, Some(callback)));
+    self.dispatch_or_queue(PendingOp::CreatePdf(path.to_string(), pdf_config, Some(callback)))?;
     Ok(())
   }
 
@@ -1010,30 +1054,31 @@ impl InnerWebView {
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     let (x, y) = bounds.position.to_logical::<f64>(1.0).into();
     let (w, h) = bounds.size.to_logical::<f64>(1.0).into();
-    self.dispatch_or_queue(PendingOp::SetBounds(x, y, w, h));
+    self.dispatch_or_queue(PendingOp::SetBounds(x, y, w, h))?;
     *self.bounds_cache.lock().unwrap() = bounds;
     Ok(())
   }
 
   pub fn set_visible(&self, visible: bool) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::SetVisible(visible));
+    self.dispatch_or_queue(PendingOp::SetVisible(visible))?;
     Ok(())
   }
 
   pub fn focus(&self) -> Result<()> {
-    self.dispatch_or_queue(PendingOp::Focus);
+    self.dispatch_or_queue(PendingOp::Focus)?;
     Ok(())
   }
 
   pub fn focus_parent(&self) -> Result<()> {
     // OHOS has no separate parent window for the webview
-    self.dispatch_or_queue(PendingOp::Focus);
+    self.dispatch_or_queue(PendingOp::Focus)?;
     Ok(())
   }
 
   pub fn dispose_child(&self) {
     if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
-      self.dispatch_or_queue(PendingOp::Remove);
+      // Drop path: creation failure is already logged; nothing to propagate to.
+      let _ = self.dispatch_or_queue(PendingOp::Remove);
     }
   }
 
@@ -1052,7 +1097,8 @@ impl InnerWebView {
 impl Drop for InnerWebView {
   fn drop(&mut self) {
     if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
-      self.dispatch_or_queue(PendingOp::Remove);
+      // Drop path: creation failure is already logged; nothing to propagate to.
+      let _ = self.dispatch_or_queue(PendingOp::Remove);
     }
   }
 }
@@ -1076,8 +1122,9 @@ pub fn platform_webview_version() -> Result<String> {
 ///
 /// We use an `Arc<Mutex<Option<Response>>>` instead of `mpsc::channel + rx.recv_timeout()`.
 /// The previous `rx.recv_timeout(3s)` blocked the NAPI main thread, violating the design doc
-/// (`p2-bridge-https-intercept/design.md:369`: "无 `run_on_main_thread + rx.recv()` 阻塞模式")
-/// and risking deadlock if any handler dispatched its responder via `run_on_main_thread`.
+/// (`p2-bridge-https-intercept/design.md:369`, which forbids "run_on_main_thread +
+/// rx.recv() blocking patterns") and risking deadlock if any handler dispatched its responder
+/// via `run_on_main_thread`.
 ///
 /// If the handler does NOT call the responder synchronously (returns before responding),
 /// we return `passthrough()` immediately — no blocking. This is a safe degradation: the
@@ -1398,7 +1445,7 @@ mod tests {
     assert!(v.contains("; SameSite=None"));
   }
 
-  // ─── S7 纯变换批：dispatch_https_intercept_sync 的各分支 ─────────────────────
+  // ─── S7 pure-transform batch: branches of dispatch_https_intercept_sync ────────
 
   fn https_test_handler(
     respond_inline: bool,
@@ -1438,7 +1485,8 @@ mod tests {
 
   #[test]
   fn https_intercept_invalid_uri_passthrough() {
-    // 协议已注册，但还原后的 URI 含空格 → Request::builder 失败 → passthrough
+    // Protocol registered, but the restored URI contains a space →
+    // Request::builder fails → passthrough
     let resp = dispatch_https_intercept_sync(
       "https://myproto.localhost/a b",
       "w1",
