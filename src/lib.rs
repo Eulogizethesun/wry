@@ -347,7 +347,7 @@
 // #[macro_use]
 // extern crate objc;
 
-#[cfg(any(target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "windows", target_os = "android", target_env = "ohos"))]
 mod custom_protocol_workaround;
 mod error;
 #[cfg(any(target_os = "android", test))]
@@ -722,6 +722,10 @@ struct WebViewAttributes<'a> {
   ///
   /// macOS doesn't provide such method and is always enabled by default. But your app will still need to add menu
   /// item accelerators to use the clipboard shortcuts.
+  ///
+  /// **OHOS** defaults to `true` (ArkWeb native clipboard shortcuts, matching
+  /// macOS/Windows keyboard behavior); setting `false` intercepts keyboard
+  /// Ctrl+C/X/V/A/Z/Y via onKeyPreIme. See the ohos-webview-flag-clipboard spec.
   pub clipboard: bool,
 
   /// Enable web inspector which is usually called browser devtools.
@@ -849,7 +853,11 @@ impl Default for WebViewAttributes<'_> {
       download_started_handler: Some(Box::new(|_, _| true)),
       download_completed_handler: None,
       new_window_req_handler: None,
-      clipboard: false,
+      // OHOS defaults to enabled (ArkWeb native clipboard shortcuts) so that
+      // default-configured webviews keep working Ctrl+C like Windows/macOS.
+      // Other platforms keep the historical `false` default. See
+      // ohos-webview-flag-clipboard spec.
+      clipboard: cfg!(target_env = "ohos"),
       #[cfg(debug_assertions)]
       devtools: true,
       #[cfg(not(debug_assertions))]
@@ -1327,6 +1335,9 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// macOS doesn't provide such method and is always enabled by default. But your app will still need to add menu
   /// item accelerators to use the clipboard shortcuts.
+  ///
+  /// **OHOS** defaults to `true` (ArkWeb native clipboard shortcuts); setting `false` intercepts keyboard
+  /// Ctrl+C/X/V/A/Z/Y via onKeyPreIme. See the ohos-webview-flag-clipboard spec.
   pub fn with_clipboard(mut self, clipboard: bool) -> Self {
     self.attrs.clipboard = clipboard;
     self
@@ -1938,6 +1949,11 @@ pub struct PlatformSpecificWebViewAttributes {
   pub window_id: Option<i64>,
   /// Whether to use `https://` origin for custom protocols (for secure-context support).
   pub use_https: bool,
+  /// Enable transparent overlay for drag-drop when ArkWeb doesn't bubble OS file drag events.
+  /// See openspec ohos-webview-drag-drop-overlay.
+  pub drag_drop_overlay: bool,
+  /// Bridge runtime for constructing `WebviewClient` (passed from tao's Window).
+  pub bridge_runtime: Option<openharmony_ability::BridgeRuntime>,
 }
 
 #[cfg(target_env = "ohos")]
@@ -1951,10 +1967,23 @@ pub trait WebViewBuilderExtOhos {
   /// instead of the raw scheme, allowing secure-context features
   /// (crypto.subtle, service workers, etc.).
   ///
-  /// **Note**: On OHOS, this is currently an API surface only — runtime
-  /// HTTPS scheme registration requires ArkWeb investigation. Calling this
-  /// method will log a warning and not change the scheme behavior.
+  /// Defaults to `false` (`PlatformSpecificWebViewAttributes::default`).
+  /// Note: tauri overrides this at runtime with the `useHttpsScheme` config
+  /// value (tauri default `false`), so the document loads via the raw
+  /// `tauri://localhost` scheme by default — which serves the embedded
+  /// frontend bundle just fine (ArkWeb's custom-protocol handler delivers
+  /// the main-frame document and `/assets/*` sub-resources).
   fn with_https_scheme(self, enabled: bool) -> Self;
+
+  /// Enable transparent drag-drop overlay for OHOS.
+  /// When ArkWeb doesn't bubble OS file drag events to ArkUI, this overlay
+  /// receives drag events and forwards them to drag_drop_handler.
+  fn with_drag_drop_overlay(self, enabled: bool) -> Self;
+
+  /// Provides the `BridgeRuntime` for constructing the bridge-based webview client.
+  /// Must be called before `build()`. The runtime is obtained from
+  /// `tao::platform::ohos::WindowExtOpenHarmony::bridge_runtime()`.
+  fn with_bridge_runtime(self, runtime: openharmony_ability::BridgeRuntime) -> Self;
 }
 
 #[cfg(target_env = "ohos")]
@@ -1966,6 +1995,16 @@ impl WebViewBuilderExtOhos for WebViewBuilder<'_> {
 
   fn with_https_scheme(mut self, enabled: bool) -> Self {
     self.platform_specific.use_https = enabled;
+    self
+  }
+
+  fn with_drag_drop_overlay(mut self, enabled: bool) -> Self {
+    self.platform_specific.drag_drop_overlay = enabled;
+    self
+  }
+
+  fn with_bridge_runtime(mut self, runtime: openharmony_ability::BridgeRuntime) -> Self {
+    self.platform_specific.bridge_runtime = Some(runtime);
     self
   }
 }
@@ -2548,7 +2587,7 @@ pub trait WebViewExtOhos {
 #[cfg(target_env = "ohos")]
 impl WebViewExtOhos for WebView {
   fn webview_handle(&self) -> OhosWebviewHandle {
-    self.webview.webview.clone()
+    self.webview.handle()
   }
 }
 
