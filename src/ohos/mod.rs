@@ -10,6 +10,7 @@ use crate::{
 };
 use cookie::Cookie;
 use http::{Request, Response, Uri};
+use openharmony_ability::MainThreadStatus;
 use openharmony_ability_plugin_webview::{
   Either, WebviewCallbacksBuilder, WebviewClient, WebviewCreateRequest,
   WebviewDownloadStartResponse, WebviewHandle, WebviewHttpsInterceptResponse,
@@ -31,6 +32,16 @@ pub use openharmony_ability_plugin_webview::WebviewBridgePlugin;
 /// The ArkTS counterpart (`WebviewCookiePlugin`) must be present in the host
 /// Ability's `bridgePlugins` list; without it the main-thread cookie fetch
 /// fails with an explicit bridge error (no silent empty results).
+///
+/// Registration errors are not propagated: on failure this logs via
+/// `log::error!` and returns normally (same swallow semantics as
+/// `tray_icon::set_ohos_app`). A swallowed failure then surfaces as an
+/// explicit `Err` from the first main-thread `cookies_for_url` call
+/// ("webview cookie sync app not set — the embedding runtime must call
+/// wry::set_ohos_app during setup"), never as silent empty results.
+/// Calling this twice is harmless: the second registration attempt is
+/// rejected by the bridge registry and only logged; the first
+/// registration stays in effect.
 pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
   if let Err(e) = openharmony_ability_plugin_webview::set_cookie_sync_app(&app) {
     log::error!(
@@ -93,7 +104,6 @@ unsafe impl<T> Sync for SendSyncBox<T> {}
 #[derive(Clone)]
 pub(crate) struct BridgeExecutor {
   handle: tokio::runtime::Handle,
-  main_thread_id: std::thread::ThreadId,
 }
 
 impl BridgeExecutor {
@@ -102,8 +112,15 @@ impl BridgeExecutor {
     // process, instead of one per webview (each InnerWebView used to spawn its
     // own `ohos-wry-bridge-rt` thread). `BridgeExecutor` is `Clone` and the
     // underlying handle is thread-safe, so all webviews multiplex the same
-    // runtime. `main_thread_id` is captured on first construction, which is the
-    // app's main thread (webviews are created from it or after it exists).
+    // runtime.
+    //
+    // Thread classification for sync-vs-async dispatch lives in
+    // `cookies_for_url` via openharmony-ability's render-entry signal
+    // (`main_thread_status`), NOT here. The old design captured "the thread
+    // that first constructed this executor" as the main thread — an unproven
+    // assumption that misclassified direct-wry embedders building their first
+    // webview on a worker, which was then misrecorded as main forever
+    // (issue #145).
     static SHARED: OnceLock<BridgeExecutor> = OnceLock::new();
     SHARED
       .get_or_init(|| Self::new_exclusive())
@@ -120,14 +137,7 @@ impl BridgeExecutor {
       .name("ohos-wry-bridge-rt".into())
       .spawn(move || runtime.block_on(std::future::pending::<()>()))
       .expect("Failed to spawn wry bridge runtime thread");
-    Self {
-      handle,
-      main_thread_id: std::thread::current().id(),
-    }
-  }
-
-  pub(crate) fn main_thread_id(&self) -> std::thread::ThreadId {
-    self.main_thread_id
+    Self { handle }
   }
 
   /// Spawn a fire-and-forget bridge call. The result is ignored.
@@ -977,36 +987,59 @@ impl InnerWebView {
   }
 
   pub fn cookies_for_url(&self, url: &str) -> Result<Vec<Cookie<'static>>> {
-    // Main thread: the async bridge is unusable here — its TSFN response needs
-    // this very thread to pump, so blocking on it would deadlock. Fetch
-    // synchronously through the dedicated `ohos.webview-cookie`
-    // MainThreadSync plugin (ArkTS `fetchCookieSync`) instead. Returns the
-    // real cookies rather than the old silent empty (issue #110).
-    if std::thread::current().id() == self.runtime.main_thread_id() {
-      let cookie_str = openharmony_ability_plugin_webview::cookies_for_url_on_main_thread(url)
-        .map_err(|e| {
-          Error::OpenHarmonyWebviewError(format!("cookies_for_url (main-thread sync bridge): {e}"))
-        })?;
-      return Ok(parse_cookie_string(&cookie_str));
+    // Thread classification uses the authoritative render-entry signal from
+    // openharmony-ability (the XComponent render entry records the NAPI main
+    // thread), NOT the id of the thread that built the first webview — a
+    // direct-wry embedder can build the first webview on a worker, which the
+    // old first-construction heuristic would then misrecord as main forever
+    // (issue #145).
+    match openharmony_ability::main_thread_status() {
+      MainThreadStatus::Main => {
+        // Main thread: the async bridge is unusable here — its TSFN response
+        // needs this very thread to pump, so blocking on it would deadlock.
+        // Fetch synchronously through the dedicated `ohos.webview-cookie`
+        // MainThreadSync plugin (ArkTS `fetchCookieSync`) instead. Returns
+        // the real cookies rather than the old silent empty (issue #110).
+        let cookie_str = openharmony_ability_plugin_webview::cookies_for_url_on_main_thread(url)
+          .map_err(|e| {
+            Error::OpenHarmonyWebviewError(format!(
+              "cookies_for_url (main-thread sync bridge): {e}"
+            ))
+          })?;
+        Ok(parse_cookie_string(&cookie_str))
+      }
+      MainThreadStatus::Worker => {
+        let handle = match self.try_handle() {
+          Some(h) => h,
+          None => return Ok(vec![]),
+        };
+        let url = url.to_string();
+        let (tx, rx) = mpsc::channel::<String>();
+        self.runtime.spawn(async move {
+          let result = handle.cookies_with_url(url).await;
+          let _ = tx.send(result.unwrap_or_default());
+        });
+        let cookie_str = rx
+          // Safe to block here: the Worker classification above guarantees we
+          // are on a worker thread, so the TSFN callback (which runs on the
+          // main thread) can complete while we wait. This is the
+          // "blocking-from-worker" pattern; the forbidden variant is blocking
+          // the MAIN thread.
+          .recv_timeout(std::time::Duration::from_secs(3))
+          .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?;
+        Ok(parse_cookie_string(&cookie_str))
+      }
+      // The render entry has not run yet, so we cannot prove which thread we
+      // are on. The async branch's blocking wait is only safe once the real
+      // main thread is known to pump the TSFN response; instead of gambling
+      // on a 3s freeze (the failure mode the old heuristic could hit on
+      // issue #145), fail fast with an explicit error. Once `render()` runs
+      // this state disappears for the rest of the process lifetime.
+      MainThreadStatus::Uninitialized => Err(Error::OpenHarmonyWebviewError(
+        "cookies_for_url: main-thread env not initialized (XComponent render entry not yet run); cannot classify caller thread"
+          .into(),
+      )),
     }
-    let handle = match self.try_handle() {
-      Some(h) => h,
-      None => return Ok(vec![]),
-    };
-    let url = url.to_string();
-    let (tx, rx) = mpsc::channel::<String>();
-    self.runtime.spawn(async move {
-      let result = handle.cookies_with_url(url).await;
-      let _ = tx.send(result.unwrap_or_default());
-    });
-    let cookie_str = rx
-      // Safe to block here: the main-thread guard above guarantees we are on
-      // a worker thread, so the TSFN callback (which runs on the main thread)
-      // can complete while we wait. This is the "blocking-from-worker"
-      // pattern; the forbidden variant is blocking the MAIN thread.
-      .recv_timeout(std::time::Duration::from_secs(3))
-      .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?;
-    Ok(parse_cookie_string(&cookie_str))
   }
 
   // Pattern A: fire-and-forget
@@ -1162,14 +1195,17 @@ impl Drop for InnerWebView {
 ///
 /// Callers: wry's own `webview_version()` wrapper (behind the default
 /// `os-webview` feature, which tauri-runtime-wry's wry dependency enables)
-/// compiles on OHOS and forwards here. tauri-runtime-wry's
-/// `webview_runtime_installed` probe deliberately hardcodes `true` on OHOS
-/// and does NOT consult it (ArkWeb is an always-present system component,
-/// and on systems below API 20 this query degrades to `Err` BY DESIGN —
-/// wiring the probe to `webview_version().is_ok()` would fail-closed every
-/// `create_webview` on those devices); tauri's `webview_version` re-export
-/// chain is additionally cfg-excluded on OHOS. Beyond that wrapper this is
-/// public API surface for direct wry users on OHOS.
+/// compiles on OHOS and forwards here. Beyond that wrapper this is public
+/// API surface for direct wry users on OHOS.
+///
+/// Consumer contract: an `Err` from this function (or from
+/// `webview_version()` on OHOS) does NOT mean "no WebView runtime
+/// installed" — ArkWeb is an always-present system component on OpenHarmony,
+/// and on systems below API 20 the `Err` only signals that this system does
+/// not export the version CAPI (`OH_NativeArkWeb_GetActiveWebEngineVersion`).
+/// Consumers gating on `webview_version().is_ok()` must not treat that `Err`
+/// as a missing runtime — doing so fail-closes webview creation on devices
+/// that are guaranteed to ship ArkWeb.
 ///
 /// Format note: unlike the sibling platforms' dotted-numeric strings
 /// (webview2 `"120.0.2210.61"`-style), this returns a kernel-generation
@@ -1426,6 +1462,71 @@ mod tests {
   fn format_set_cookie_value_minimal() {
     let cookie = Cookie::build(("k", "v")).build();
     assert_eq!(format_set_cookie_value(&cookie), "k=v");
+  }
+
+  // This module is gated on `target_env = "ohos"`: these tests only run in
+  // test builds for OHOS targets (host `cargo test` doesn't compile it).
+  #[test]
+  fn parse_cookie_string_parses_multiple_cookies() {
+    let cookies = parse_cookie_string("k=v; k2=v2");
+    assert_eq!(cookies.len(), 2);
+    assert_eq!(cookies[0].name(), "k");
+    assert_eq!(cookies[0].value(), "v");
+    assert_eq!(cookies[1].name(), "k2");
+    assert_eq!(cookies[1].value(), "v2");
+  }
+
+  #[test]
+  fn parse_cookie_string_empty_input_yields_empty() {
+    assert!(parse_cookie_string("").is_empty());
+  }
+
+  #[test]
+  fn parse_cookie_string_whitespace_only_segments_yields_empty() {
+    assert!(parse_cookie_string("  ;  ").is_empty());
+  }
+
+  #[test]
+  fn parse_cookie_string_drops_invalid_segments() {
+    // A segment without `=` is rejected by cookie 0.18's parse and dropped
+    // via `.ok()`.
+    let cookies = parse_cookie_string("k=v; novalue; k2=v2");
+    assert_eq!(cookies.len(), 2);
+  }
+
+  #[test]
+  fn parse_cookie_string_keeps_empty_value() {
+    // cookie 0.18 parses `k=` as a valid cookie with an empty value.
+    let cookies = parse_cookie_string("k=");
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0].name(), "k");
+    assert_eq!(cookies[0].value(), "");
+  }
+
+  #[test]
+  fn parse_cookie_string_value_may_contain_equals() {
+    // Splits on the first `=`: name "k", value "a=b".
+    let cookies = parse_cookie_string("k=a=b");
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0].name(), "k");
+    assert_eq!(cookies[0].value(), "a=b");
+  }
+
+  #[test]
+  fn parse_cookie_string_does_not_percent_decode() {
+    // Plain `Cookie::parse` keeps values URL-encoded (decoding only happens
+    // in the `*_encoded` variants), so the raw `%20` survives.
+    let cookies = parse_cookie_string("k=a%20b");
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0].value(), "a%20b");
+  }
+
+  #[test]
+  fn parse_cookie_string_drops_empty_name_segment() {
+    // `=v` is rejected by cookie 0.18 (EmptyName) and dropped via `.ok()`.
+    let cookies = parse_cookie_string("k=v; =novalue");
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0].name(), "k");
   }
 
   #[test]
