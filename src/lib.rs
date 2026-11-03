@@ -2374,7 +2374,16 @@ impl WebView {
   ///   components (partial updates) never enter the cache - a sentinel
   ///   component keeps its previously cached value while the set components
   ///   of the same request update theirs (per-component, matching the ArkTS
-  ///   render granularity).
+  ///   render granularity). That per-component merge holds only within one
+  ///   dpi variant: when an incoming position or size axis carries a
+  ///   different variant than the cached one (Logical vs Physical), the axis
+  ///   is merged as a whole - a partial write (a sentinel component present
+  ///   on that axis) is dropped entirely and the cached axis keeps its
+  ///   previous variant and values, including the components that were set
+  ///   in the request, because mixing units across a variant switch would
+  ///   need a scale factor the cache does not track. Only a full-axis write
+  ///   (no sentinel component on that axis) replaces the cached axis under
+  ///   the new variant.
   ///
   ///   In every case a cached component reflects only the last real write;
   ///   do not use this value to reconstruct or fill in unknown geometry
