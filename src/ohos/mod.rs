@@ -501,9 +501,13 @@ enum PendingOp {
   /// #195: queued open_devtools -- `setWebDebuggingAccess(true)` issued while
   /// create was still pending, replayed by the create drain once the handshake
   /// completes. Only the open intent is queued (design D5); the process-level
-  /// [`DEVTOOLS_ENABLED`] flag keeps repeat opens idempotent.
+  /// [`DEVTOOLS_ENABLED`] flag keeps repeat opens idempotent. #253: the op
+  /// carries the queueing webview's open-state flag, because the replay is
+  /// that path's only success-shaped write (sets the flag on `Ok`) and the
+  /// never-replayable/failed paths (failed create, dead drain, failed replay)
+  /// must be able to clear it without reaching the `InnerWebView` instance.
   #[cfg(any(debug_assertions, feature = "devtools"))]
-  SetDevtools,
+  SetDevtools(Arc<AtomicBool>),
 }
 
 impl PendingOp {
@@ -596,7 +600,7 @@ impl PendingOp {
         }
       }
       #[cfg(any(debug_assertions, feature = "devtools"))]
-      PendingOp::SetDevtools => {
+      PendingOp::SetDevtools(flag) => {
         // #195 replay: the open intent was recorded before the handshake; the
         // process-level DEVTOOLS_ENABLED flag was already set at the call
         // site, so this only needs the runtime channel.
@@ -607,6 +611,16 @@ impl PendingOp {
           // open_devtools in this process (same policy as
           // `failed_create_cleanup` for never-replayable queued opens).
           devtools_open_failed("queued open_devtools replay", &e);
+          // #253 open-state: the replay failed, so the queueing webview is
+          // not open -- clear the flag it carries (an idempotent early-return
+          // on that webview may have latched it true while the replay was
+          // still pending).
+          flag.store(false, Ordering::SeqCst);
+        } else {
+          // #253 open-state: the queued open succeeded -- the replay IS the
+          // queue path's success-shaped write, so set the carried flag for
+          // `is_devtools_open`.
+          flag.store(true, Ordering::SeqCst);
         }
       }
     }
@@ -633,6 +647,13 @@ impl PendingOp {
 /// that thread dies right after the check, the enable future is never polled,
 /// so neither the enable nor its async failure handler runs and the intent
 /// stays latched: a later `open_devtools` early-returns on the fence.
+///
+/// #253: this process-level intent is distinct from the per-webview
+/// open-state flag (`InnerWebView::devtools_open`) that [`is_devtools_open`]
+/// reports: the intent is recorded at call time (it doubles as the
+/// idempotence fence), while the open-state flag is set only on a
+/// success-shaped open path and rolled back on failure, so a failed open
+/// reports `false`.
 #[cfg(any(debug_assertions, feature = "devtools"))]
 static DEVTOOLS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -703,12 +724,18 @@ pub(crate) struct InnerWebView {
   page_loaded: Arc<AtomicBool>,
   url_cache: Arc<Mutex<String>>,
   bounds_cache: Mutex<Rect>,
-  /// Per-webview "devtools requested" flag - written by `open_devtools` /
-  /// `close_devtools`, read by `is_devtools_open`. Every one of those is
+  /// Per-webview devtools open-state flag (#253) - written by `open_devtools`
+  /// / `close_devtools`, read by `is_devtools_open`. It mirrors the actual
+  /// open state, not the request intent: set on a success-shaped open path
+  /// (ready-branch dispatch, successful `SetDevtools` replay, idempotent
+  /// early-return), cleared again on every open failure path, so it reads
+  /// `false` after a failed open. Shared as an `Arc` because a queued
+  /// `PendingOp::SetDevtools` carries it into the create-drain replay, which
+  /// runs without the `InnerWebView` instance. Every one of those paths is
   /// devtools-gated, so the field is too (Gate F11: otherwise it is a
   /// dead_code warning in a release build without the devtools feature).
   #[cfg(any(debug_assertions, feature = "devtools"))]
-  devtools_open: AtomicBool,
+  devtools_open: Arc<AtomicBool>,
   /// #188: the creation-time incognito flag (`WebViewAttributes.incognito`).
   /// The main-thread `cookies_for_url` sync bridge is id-less, so the store
   /// selector has to travel with the caller -- retained here and passed to
@@ -722,7 +749,10 @@ pub(crate) struct InnerWebView {
 
 /// m5: failed-create cleanup -- a queued `SetDevtools` can never replay once
 /// creation failed, so the process-level open intent must be released (a later
-/// webview's `open_devtools` dispatches again instead of silently no-oping).
+/// webview's `open_devtools` dispatches again instead of silently no-oping),
+/// and the per-webview open-state flag each queued op carries is cleared
+/// (#253 -- an idempotent early-return may have latched it true while the
+/// replay was still pending).
 /// Ownership is exact: the queued open only exists when THIS webview flipped
 /// the intent (an earlier applied open makes `open_devtools` an early-return
 /// idempotent no-op, never a queue entry). Factored out of the create-failure
@@ -731,8 +761,20 @@ pub(crate) struct InnerWebView {
 /// the aarch64 device or the x86_64 emulator).
 fn failed_create_cleanup(guard: &mut Vec<PendingOp>) {
   #[cfg(any(debug_assertions, feature = "devtools"))]
-  if guard.iter().any(|op| matches!(op, PendingOp::SetDevtools)) {
-    devtools_close_intent();
+  {
+    let mut open_queued = false;
+    for op in guard.iter() {
+      if let PendingOp::SetDevtools(flag) = op {
+        // #253 open-state: this queued open can never replay after the
+        // failed create -- clear the flag it carries so `is_devtools_open`
+        // reports false.
+        flag.store(false, Ordering::SeqCst);
+        open_queued = true;
+      }
+    }
+    if open_queued {
+      devtools_close_intent();
+    }
   }
   // Queued ops can never execute -- drop them.
   guard.clear();
@@ -752,13 +794,16 @@ fn queue_pre_handshake_open(
   handle: &OnceLock<WebviewHandle>,
   creation_error: &std::sync::Mutex<Option<String>>,
   runtime: &BridgeExecutor,
+  flag: &Arc<AtomicBool>,
 ) {
   if let Err(e) = dispatch_or_queue_op(
     pending_ops,
     handle,
     creation_error,
     runtime,
-    PendingOp::SetDevtools,
+    // #253: the queueing webview's open-state flag travels with the op --
+    // the replay sets it on success and every never-replayed path clears it.
+    PendingOp::SetDevtools(Arc::clone(flag)),
   ) {
     // The queue rejected the open: release the intent so a later open (this
     // or any other webview) dispatches again instead of no-oping forever.
@@ -966,7 +1011,7 @@ impl InnerWebView {
     // binding with them so a release build without the devtools feature has
     // no dead local either.
     #[cfg(any(debug_assertions, feature = "devtools"))]
-    let devtools_open = AtomicBool::new(false);
+    let devtools_open = Arc::new(AtomicBool::new(false));
 
     // 1. Register reverse callbacks (before create)
     let mut callbacks_builder = WebviewCallbacksBuilder::new(&id);
@@ -1431,7 +1476,7 @@ impl InnerWebView {
           if !runtime_for_create.pump_thread_alive()
             && pending
               .iter()
-              .any(|op| matches!(op, PendingOp::SetDevtools))
+              .any(|op| matches!(op, PendingOp::SetDevtools(_)))
           {
             devtools_open_failed(
               "create drain replay",
@@ -1439,6 +1484,15 @@ impl InnerWebView {
                 "bridge runtime pump thread is dead; the queued open will never be replayed".into(),
               ),
             );
+            // #253 open-state: the replay will never be polled -- clear the
+            // open-state flags carried by the drained ops (an idempotent
+            // early-return may have latched them true while the replay was
+            // pending).
+            for op in &pending {
+              if let PendingOp::SetDevtools(flag) = op {
+                flag.store(false, Ordering::SeqCst);
+              }
+            }
           }
           runtime_for_create.spawn(async move {
             for op in pending {
@@ -1625,24 +1679,44 @@ impl InnerWebView {
   // and the first poll of the create future runs neither match arm, no
   // failure event fires there, so all six release points are skipped and a
   // queued `SetDevtools` keeps the intent latched. The per-webview
-  // `devtools_open` flag is NOT rolled back on an async enable failure: it
-  // records the requested intent (what `is_devtools_open` reports), and a
-  // later `close_devtools` clears it.
+  // `devtools_open` flag is an open-state mirror, NOT a request intent
+  // (#253, issue Eulogizethesun/tauri#253): it is set only on a
+  // success-shaped path -- the ready-branch dispatch below, a successful
+  // `PendingOp::SetDevtools` replay (the queue path's success shape), and
+  // the idempotent early-return below (a prior open is already queued or
+  // applied process-wide) -- and cleared again on every open failure path
+  // (async enable Err, the two dead-pump legs, a failed create, a failed
+  // replay), so `is_devtools_open()` reports false after a failed open.
+  // Residual (disclosed): an early-return latch is per-webview and cannot
+  // be reached by the failure path of the EARLIER webview's queued open --
+  // if that earlier open later fails, this webview's flag stays true until
+  // a `close_devtools` or a later successful open re-syncs it.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn open_devtools(&self) {
     let needs_dispatch = devtools_open_intent();
-    self.devtools_open.store(true, Ordering::SeqCst);
     if !needs_dispatch {
       // Idempotent: an open is already queued or applied (process-level API).
+      // #253 open-state: mirror the process-level state onto this webview
+      // without a new dispatch -- ArkWeb `setWebDebuggingAccess` is
+      // process-static, so devtools is open for this webview too.
+      self.devtools_open.store(true, Ordering::SeqCst);
       return;
     }
     match self.try_handle() {
       Some(handle) => {
+        // #253 open-state: dispatching counts as open until the enable
+        // settles -- the failure legs below roll the flag back, so
+        // `is_devtools_open()` reports false after a failed open.
+        self.devtools_open.store(true, Ordering::SeqCst);
+        let open_flag = Arc::clone(&self.devtools_open);
         self.runtime.spawn(async move {
           if let Err(e) = handle.set_web_debugging_access(true).await {
             // W26-4: a failed enable must not latch the idempotence gate --
             // release the intent so a later open dispatches again.
             devtools_open_failed("open_devtools", &e);
+            // #253 open-state: the enable failed -- roll the flag back so
+            // `is_devtools_open()` reports false.
+            open_flag.store(false, Ordering::SeqCst);
           }
         });
         // Gate F5: synchronous failure leg. `BridgeExecutor::spawn` cannot
@@ -1671,14 +1745,22 @@ impl InnerWebView {
               "bridge runtime pump thread is dead; the enable will never be polled".into(),
             ),
           );
+          // #253 open-state: the enable future will never be polled -- roll
+          // the optimistic flag back (same failure shape as the async Err).
+          self.devtools_open.store(false, Ordering::SeqCst);
         }
       }
       // Create still pending: queue for replay once the handshake completes.
+      // #253 open-state: the queue path sets nothing here -- the flag goes
+      // true only when the replayed `SetDevtools` succeeds (the op carries
+      // this webview's flag), so a failed create / dead drain / failed
+      // replay leaves it false.
       None => queue_pre_handshake_open(
         &self.pending_ops,
         &self.handle,
         &self.creation_error,
         &self.runtime,
+        &self.devtools_open,
       ),
     }
   }
@@ -1701,6 +1783,9 @@ impl InnerWebView {
     self.devtools_open.store(false, Ordering::SeqCst);
   }
 
+  /// #253: open-state mirror of the devtools visibility -- `true` only while
+  /// a success-shaped open path holds (see [`Self::open_devtools`]); a failed
+  /// open reports `false`.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   pub fn is_devtools_open(&self) -> bool {
     self.devtools_open.load(Ordering::SeqCst)
@@ -3177,12 +3262,14 @@ mod tests {
     let runtime = BridgeExecutor::new();
 
     // Pre-handshake: both ops land in the production queue, order preserved.
+    // #253: the queued open carries its webview's open-state flag (scratch
+    // here -- queue mechanics are under test, not the flag).
     dispatch_or_queue_op(
       &queue,
       &handle,
       &creation_error,
       &runtime,
-      PendingOp::SetDevtools,
+      PendingOp::SetDevtools(Arc::new(AtomicBool::new(false))),
     )
     .expect("pre-handshake op must queue");
     dispatch_or_queue_op(
@@ -3197,7 +3284,7 @@ mod tests {
       let guard = queue.lock().unwrap();
       assert_eq!(guard.len(), 2, "both ops must sit in the production queue");
       assert!(
-        matches!(guard[0], PendingOp::SetDevtools),
+        matches!(guard[0], PendingOp::SetDevtools(_)),
         "SetDevtools must keep its queue position for the create drain"
       );
     }
@@ -3230,9 +3317,14 @@ mod tests {
   /// UT for #195 + fix-variant m5: a queued open that can never replay (failed
   /// create) releases the process-level intent via the REAL cleanup fn, so a
   /// later webview's open dispatches again instead of silently no-oping.
+  /// #253 open-state: the cleanup also clears the per-webview open-state flag
+  /// the queued op carries -- seeded `true` here to model the resurrection
+  /// risk (an idempotent early-return on the same webview latched it true
+  /// while the replay was still pending); without the clear, `is_devtools_open`
+  /// would report true for a webview whose queued open can never replay.
   /// # Brief: 1) flip the intent 2) run failed_create_cleanup over a queue
-  /// holding SetDevtools 3) assert the queue empties and a later open
-  /// dispatches again.
+  /// holding SetDevtools with a seeded-true carried flag 3) assert the queue
+  /// empties, the carried flag reads false, and a later open dispatches again.
   #[cfg(any(debug_assertions, feature = "devtools"))]
   #[test]
   fn ut_failed_create_releases_queued_devtools_intent() {
@@ -3243,11 +3335,20 @@ mod tests {
     // The webview's open_devtools flips the intent and queues SetDevtools.
     assert!(devtools_open_intent(), "first open must flip the intent");
 
-    let mut queue: Vec<PendingOp> = vec![PendingOp::SetDevtools, PendingOp::Reload];
+    let carried = Arc::new(AtomicBool::new(true));
+    let mut queue: Vec<PendingOp> = vec![
+      PendingOp::SetDevtools(Arc::clone(&carried)),
+      PendingOp::Reload,
+    ];
     failed_create_cleanup(&mut queue);
     assert!(
       queue.is_empty(),
       "cleanup must drop the never-replayable ops"
+    );
+    assert!(
+      !carried.load(Ordering::SeqCst),
+      "cleanup must clear the carried open-state flag (a never-replayable \
+       queued open must not leave is_devtools_open true)"
     );
     assert!(
       devtools_open_intent(),
@@ -3279,9 +3380,12 @@ mod tests {
 
     // open_devtools' first step flips the intent; then the None arm hits the
     // dead queue (create already failed -- the m4 state dispatch rejects).
+    // #253: the queue attempt carries the webview's open-state flag (scratch
+    // here); the queue path itself never sets it.
     assert!(devtools_open_intent(), "first open must flip the intent");
     *creation_error.lock().unwrap() = Some("injected create failure".to_string());
-    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+    let dead_queue_flag = Arc::new(AtomicBool::new(false));
+    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime, &dead_queue_flag);
 
     assert!(
       !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
@@ -3302,12 +3406,19 @@ mod tests {
     // the op and the intent stays latched (idempotence fence intact).
     *creation_error.lock().unwrap() = None;
     assert!(devtools_open_intent(), "control open must flip the intent");
-    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+    let healthy_queue_flag = Arc::new(AtomicBool::new(false));
+    queue_pre_handshake_open(
+      &queue,
+      &handle,
+      &creation_error,
+      &runtime,
+      &healthy_queue_flag,
+    );
     {
       let guard = queue.lock().unwrap();
       assert_eq!(guard.len(), 1, "the healthy queue must hold the open");
       assert!(
-        matches!(guard[0], PendingOp::SetDevtools),
+        matches!(guard[0], PendingOp::SetDevtools(_)),
         "the queued op must be SetDevtools for the create drain"
       );
     }
@@ -3467,9 +3578,11 @@ mod tests {
     );
 
     // open_devtools' None arm: the intent is flipped, then the queue attempt
-    // hits the dead pump - the Err releases the intent (no latch).
+    // hits the dead pump - the Err releases the intent (no latch). #253: the
+    // queue attempt carries the webview's open-state flag (scratch here).
     assert!(devtools_open_intent(), "the open flips the intent first");
-    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime);
+    let dead_pump_flag = Arc::new(AtomicBool::new(false));
+    queue_pre_handshake_open(&queue, &handle, &creation_error, &runtime, &dead_pump_flag);
     assert!(
       !DEVTOOLS_ENABLED.load(Ordering::SeqCst),
       "the dead-pump queue arm must release the open intent"
