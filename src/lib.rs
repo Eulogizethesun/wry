@@ -51,7 +51,7 @@
 //! event_loop.run_app(&mut app).unwrap();
 //! ```
 //!
-//! If you also want to support Wayland too, then we recommend you use [`WebViewBuilderExtUnix::new_gtk`] on Linux.
+//! If you also want to support Wayland too, then we recommend you use `WebViewBuilderExtUnix::new_gtk` on Linux.
 //! See the following example using [`tao`]:
 //!
 //! ```no_run
@@ -111,7 +111,7 @@
 //! ```
 //!
 //! If you want to support X11 and Wayland at the same time, we recommend using
-//! [`WebViewExtUnix::new_gtk`] or [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+//! `WebViewExtUnix::new_gtk` or `WebViewBuilderExtUnix::new_gtk` with `gtk::Fixed`.
 //!
 //! ```no_run
 //! # use wry::{WebViewBuilder, raw_window_handle, Rect, dpi::*};
@@ -374,8 +374,6 @@ pub mod prelude {
 #[cfg(target_os = "android")]
 pub use android::JniHandle;
 
-#[cfg(target_env = "ohos")]
-pub use ohos::OhosWebviewHandle;
 #[cfg(target_os = "android")]
 use android::*;
 
@@ -414,7 +412,12 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
 #[cfg(target_env = "ohos")]
 pub(crate) mod ohos;
 #[cfg(target_env = "ohos")]
-pub use ohos::*;
+use ohos::*;
+// Targeted re-exports only (mirrors the android pattern of a private glob import
+// plus explicit public items): `InnerWebView` and `platform_webview_version`
+// stay crate-private — upstream never exposes them on any platform.
+#[cfg(target_env = "ohos")]
+pub use ohos::{set_ohos_app, OhosWebviewHandle, PdfConfig, WebviewBridgePlugin};
 
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc};
 
@@ -482,6 +485,9 @@ pub enum NewWindowResponse {
   /// **Linux**: The webview must be related to the caller webview. See [`WebViewBuilderExtUnix::with_related_view`].
   /// **Windows**: The webview must use the same environment as the caller webview. See [`WebViewBuilderExtWindows::with_environment`].
   /// **macOS**: The webview must use the same configuration as the caller webview. See [`WebViewBuilderExtMacos::with_webview_configuration`].
+  /// **OpenHarmony**: treated like [`NewWindowResponse::Deny`] for the ArkWeb
+  /// popup itself -- tauri builds its own OS window and cancels ArkWeb's popup
+  /// (see `with_new_window_req_handler`).
   #[cfg(not(any(target_os = "android", target_os = "ios")))]
   Create {
     #[cfg(all(
@@ -633,6 +639,11 @@ struct WebViewAttributes<'a> {
   /// - **Android:** When [addDocumentStartJavaScript] is not supported,
   ///   we prepend them to each HTML head (implementation only supported on custom protocol URLs).
   ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes); each script's `for_main_frame_only` flag is ignored.
+  ///   Whether `file://` pages are covered by the `"*"` rule is unverified --
+  ///   do not assume injection there until probed on a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
@@ -930,7 +941,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **Android / iOS:** Unsupported.
+  /// - **Android / iOS / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_back_forward_navigation_gestures(mut self, gesture: bool) -> Self {
     self.attrs.back_forward_navigation_gestures = gesture;
     self
@@ -963,6 +974,12 @@ impl<'a> WebViewBuilder<'a> {
   }
 
   /// Sets whether the WebView should be visible or not.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **OpenHarmony**: Forwarded as `style.visible` in the creation payload
+  ///   (#188); the webview honors it at creation time. Use
+  ///   [`WebView::set_visible`] to change visibility after creation.
   pub fn with_visible(mut self, visible: bool) -> Self {
     self.attrs.visible = visible;
     self
@@ -993,6 +1010,14 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Android:** When [addDocumentStartJavaScript] is not supported,
   ///   we prepend them to each HTML head (implementation only supported on custom protocol URLs).
   ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes). Whether `file://` pages are covered by the `"*"`
+  ///   rule is unverified -- do not assume injection there until probed on
+  ///   a device. This variant delegates to
+  ///   [`Self::with_initialization_script_for_main_only`] with
+  ///   `for_main_frame_only = true`, a flag OHOS ignores, so both variants
+  ///   take the same OHOS injection path.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
@@ -1016,6 +1041,11 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **Windows:** scripts are always added to subframes regardless of the `for_main_frame_only` option.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
+  /// - **OpenHarmony:** scripts are injected via ArkWeb `ScriptItem`s into every
+  ///   frame matching the script rules (`"*"` plus the registered custom
+  ///   schemes), and `for_main_frame_only` is ignored. Whether `file://` pages
+  ///   are covered by the `"*"` rule is unverified -- do not assume injection
+  ///   there until probed on a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub fn with_initialization_script_for_main_only<S: Into<String>>(
@@ -1114,6 +1144,18 @@ impl<'a> WebViewBuilder<'a> {
   /// - macOS, iOS and Linux: `<scheme_name>://<path>` (so it will be `wry://path/to/page).
   /// - Windows and Android: `http://<scheme_name>.<path>` by default (so it will be `http://wry.path/to/page`). To use `https` instead of `http`, use [`WebViewBuilderExtWindows::with_https_scheme`] and [`WebViewBuilderExtAndroid::with_https_scheme`].
   ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** when combined with
+  ///   `WebViewBuilderExtOhos::with_https_scheme`, the intercept
+  ///   channel is synchronous-only -- a responder that fires after this closure
+  ///   returns (the `std::thread::spawn` pattern in the example below) has its
+  ///   result **discarded** and the request passes through (committer
+  ///   Eulogizethesun/tauri#187). On OHOS, register asynchronous handlers via
+  ///   the native (non-https) [`Self::with_custom_protocol`] /
+  ///   [`Self::with_asynchronous_custom_protocol`] path only; the https form
+  ///   requires a synchronous `responder.respond(...)`.
+  ///
   /// # Examples
   ///
   /// ```no_run
@@ -1180,6 +1222,18 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// Note, that if you do block this behavior, it won't be possible to drop files on `<input type="file">` forms.
   /// Also note, that it's not possible to manually set the value of a `<input type="file">` via JavaScript for security reasons.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** three corrected semantics (committer
+  ///   Eulogizethesun/tauri#193): (1) the `bool` return value of all four event
+  ///   handlers is ignored -- but the default drop behavior is NOT unblockable:
+  ///   ArkWeb consumes OS file drops by navigating to `file://<dropped file>`,
+  ///   and the ArkTS layer's `onLoadIntercept` constantly intercepts that
+  ///   navigation and forwards it as the drag-drop event, so the default
+  ///   navigation is already prevented; (2) `Enter` events always carry empty
+  ///   `paths` -- only `Drop` carries the dropped paths; (3) re-enabling the
+  ///   default behavior via a `bool` return is not supported.
   pub fn with_drag_drop_handler<F>(mut self, handler: F) -> Self
   where
     F: Fn(DragDropEvent) -> bool + 'static,
@@ -1352,6 +1406,12 @@ impl<'a> WebViewBuilder<'a> {
   /// ## Platform-specific:
   ///
   /// - **Windows**: The closure is executed on a separate thread to prevent a deadlock.
+  /// - **OpenHarmony**: [`NewWindowFeatures::size`] and [`NewWindowFeatures::position`] are
+  ///   always `None` (ArkWeb does not expose the requested popup geometry), and
+  ///   [`NewWindowOpener`] is an empty struct with no webview reference. Returning
+  ///   [`NewWindowResponse::Create`] is treated like [`NewWindowResponse::Deny`] for the
+  ///   ArkWeb popup itself: tauri builds its own OS window for the new webview and cancels
+  ///   ArkWeb's popup, so `true` must never be returned for the `Create` case.
   ///
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
   pub fn with_new_window_req_handler(
@@ -1388,7 +1448,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - Windows: Requires WebView2 Runtime version 101.0.1210.39 or higher, does nothing on older versions,
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10121039>
-  /// - **Android:** Unsupported yet.
+  /// - **Android / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_incognito(mut self, incognito: bool) -> Self {
     self.attrs.incognito = incognito;
     self
@@ -1407,7 +1467,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **macOS**: Requires macOS 14.0+ and the `mac-proxy` feature flag to be enabled. Supports HTTP CONNECT and SOCKSv5 proxies.
   /// - **Windows / Linux**: Supports HTTP CONNECT and SOCKSv5 proxies.
-  /// - **Android / iOS:** Not supported.
+  /// - **Android / iOS / OpenHarmony:** Not supported (silently ignored).
   pub fn with_proxy_config(mut self, configuration: ProxyConfig) -> Self {
     self.attrs.proxy_config = Some(configuration);
     self
@@ -1417,7 +1477,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **macOS / Android / iOS:** Unsupported.
+  /// - **macOS / Android / iOS / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_focused(mut self, focused: bool) -> Self {
     self.attrs.focused = focused;
     self
@@ -1440,7 +1500,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific
   ///
-  /// - **Linux / Windows / Android**: Unsupported. Workarounds like a pending WebLock transaction might suffice.
+  /// - **Linux / Windows / Android / OpenHarmony**: Unsupported (silently ignored). Workarounds like a pending WebLock transaction might suffice.
   /// - **iOS**: Supported since version 17.0+.
   /// - **macOS**: Supported since version 14.0+.
   ///
@@ -1471,7 +1531,7 @@ impl<'a> WebViewBuilder<'a> {
   ///   "Suggestions") may not honor `autocomplete="off"` attributes on input
   ///   elements in some cases. When this option is `false`, that autofill
   ///   behavior will be disabled.
-  /// - **macOS / Linux / Android / iOS**: Unsupported and ignored.
+  /// - **macOS / Linux / Android / iOS / OpenHarmony**: Unsupported and ignored.
   pub fn with_general_autofill_enabled(mut self, enabled: bool) -> Self {
     self.attrs.general_autofill_enabled = enabled;
     self
@@ -1973,6 +2033,16 @@ pub trait WebViewBuilderExtOhos {
   /// `tauri://localhost` scheme by default — which serves the embedded
   /// frontend bundle just fine (ArkWeb's custom-protocol handler delivers
   /// the main-frame document and `/assets/*` sub-resources).
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** the use_https intercept channel is synchronous-only
+  ///   (committer Eulogizethesun/tauri#187) -- a handler that does not call
+  ///   `responder.respond(...)` before returning is treated as "no response":
+  ///   its eventual result is discarded and the request passes through (wry
+  ///   logs a warn and returns the passthrough response). Async handlers must
+  ///   use the native (non-`with_https_scheme`) custom-protocol path, which
+  ///   fully supports asynchronous responders.
   fn with_https_scheme(self, enabled: bool) -> Self;
 
   /// Enable transparent drag-drop overlay for OHOS.
@@ -2243,23 +2313,98 @@ impl WebView {
   }
 
   /// Clear all browsing data
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **OpenHarmony**: additionally clears cookies (persistent and session)
+  ///   via `WebCookieManager.clearAllCookiesSync(false)` before the
+  ///   browsing-data cleanup (#191; availability-guarded, a missing/throwing
+  ///   API only warns). Scope disclosure: ArkWeb's `WebCookieManager` is
+  ///   process-global, not per-webview, and the `false` argument selects the
+  ///   non-incognito store -- the wipe covers that store for every webview in
+  ///   the process, not just this one. Not cleared: SSL cache and
+  ///   clientAuthCache -- the SDK exposes no public API for them.
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
   }
 
-  /// Create a PDF from the current webview content and save to the given path.
+  /// Returns the webview bounds.
   ///
-  /// Currently only supported on OpenHarmony.
-  #[cfg(target_env = "ohos")]
-  pub fn create_pdf(
-    &self,
-    path: &str,
-    config: Option<PdfConfig>,
-    callback: Box<dyn Fn(bool) + Send + 'static>,
-  ) -> Result<()> {
-    self.webview.create_pdf(path, config, callback)
-  }
-
+  /// What the value represents is platform-dependent:
+  ///
+  /// - **Windows / macOS / iOS**: the current geometry, read back live from
+  ///   the platform view.
+  /// - **Linux (GTK)**: the read-back is partial - on X11 the position and
+  ///   size come from the X window attributes of the webview's own X window
+  ///   (for child webviews); a MAIN webview embeds directly into the parent
+  ///   window and its read-back targets the parent's X window
+  ///   (src/webkitgtk/mod.rs `new_x11`), so `bounds()` returns the parent
+  ///   window's screen geometry rather than the webview's own geometry. A
+  ///   failed read silently falls back to the [`Rect`] default; on non-X11
+  ///   backends the size comes from the GTK allocation while the position is
+  ///   always (0, 0).
+  /// - **Android**: a stub -- always the [`Rect`] default, regardless of the
+  ///   actual layout.
+  /// - **OpenHarmony**: cache-only -- the last bounds written at creation
+  ///   (builder bounds) or by [`WebView::set_bounds`]. It is NOT a live
+  ///   geometry readback. The creation paths form a 2x2 matrix - webview
+  ///   kind (MAIN or child) times bounds mode (the default or an explicit
+  ///   `with_bounds`) - and the rows differ in what the cache holds (the
+  ///   public builder starts from `WebViewAttributes::default()`, whose
+  ///   bounds default to logical origin + 200x200; the `None` arm is
+  ///   unreachable through the builder, and the create-geometry style write
+  ///   is gated on `is_child && bounds.is_some()`):
+  ///   - MAIN, no explicit `with_bounds`: no create geometry is written, the
+  ///     webview keeps natural layout, and the cache holds the 200x200
+  ///     default placeholder - NOT the actual on-screen geometry, which
+  ///     follows the container;
+  ///   - MAIN, explicit `with_bounds`: no create geometry is written either,
+  ///     yet the cache holds the explicit rectangle - `bounds()` reports
+  ///     requested-but-never-applied geometry, the most misleading row;
+  ///   - child, no explicit `with_bounds`: the 200x200 default is itself
+  ///     written as the create geometry, so the cache matches the applied
+  ///     geometry - the default placeholder is real layout here;
+  ///   - child, explicit `with_bounds`: the explicit rectangle is written as
+  ///     the create geometry - the only creation row where the cache holds
+  ///     an explicitly requested rect that the render layer actually
+  ///     applied.
+  ///
+  ///   `set_bounds` is not a creation path: it writes the requested
+  ///   geometry, except that tauri-runtime-wry's `i32::MIN` sentinel
+  ///   components (partial updates) never enter the cache - a sentinel
+  ///   component keeps its previously cached value while the set components
+  ///   of the same request update theirs (per-component, matching the ArkTS
+  ///   render granularity). That per-component merge holds only within one
+  ///   dpi variant: when an incoming position or size axis carries a
+  ///   different variant than the cached one (Logical vs Physical), the axis
+  ///   is merged as a whole - a partial write (a sentinel component present
+  ///   on that axis) is dropped entirely and the cached axis keeps its
+  ///   previous variant and values, including the components that were set
+  ///   in the request, because mixing units across a variant switch would
+  ///   need a scale factor the cache does not track. Only a full-axis write
+  ///   (no sentinel component on that axis) replaces the cached axis under
+  ///   the new variant.
+  ///
+  ///   In every case a cached component reflects only the last real write;
+  ///   do not use this value to reconstruct or fill in unknown geometry
+  ///   components.
+  ///   The cache is refreshed on window resize only while the embedding
+  ///   runtime re-issues `set_bounds` (tauri-runtime-wry's autoresize
+  ///   flow); ArkUI-initiated layout changes (container relayout) are not
+  ///   observed.
+  /// - **OpenHarmony render semantics** (openspec ohos-webview-sizing): a
+  ///   CHILD create request with explicit bounds renders the webview at the
+  ///   requested size (not inflated to the container; the style write is
+  ///   child-only, so a MAIN create never carries bounds -- its `with_bounds`
+  ///   rect is cache-only, see the matrix above), and a runtime
+  ///   `set_bounds` applies position AND size for a full request and skips
+  ///   `i32::MIN` sentinel components on partial requests -- a SetSize-shaped
+  ///   partial applies size only, still flipping a natural-layout
+  ///   (bounds-less) webview away from container following; a
+  ///   SetPosition-shaped first request (size pair = `i32::MIN` sentinel,
+  ///   skipped by the ArkTS render layer) leaves natural layout in place. A
+  ///   bounds-less webview keeps natural layout: it renders at "100%" and
+  ///   follows window resizes through container layout.
   pub fn bounds(&self) -> Result<Rect> {
     self.webview.bounds()
   }
@@ -2267,7 +2412,29 @@ impl WebView {
   /// Set the webview bounds.
   ///
   /// This is only effective if the webview was created as a child
-  /// or created using [`WebViewBuilderExtUnix::new_gtk`] with [`gtk::Fixed`].
+  /// or created using `WebViewBuilderExtUnix::new_gtk` with `gtk::Fixed`.
+  ///
+  /// The gtk/child-scope sentence above is Unix-desktop-only; OpenHarmony
+  /// is not governed by it.
+  ///
+  /// OpenHarmony: the OHOS backend forwards the request to the ArkTS render
+  /// layer, which applies position AND size for a full request and skips
+  /// `i32::MIN` sentinel components on partial requests (tauri-runtime-wry's
+  /// SetSize/SetPosition updates, issue Eulogizethesun/tauri#241); for a
+  /// child webview the first `set_bounds` is an explicit-to-explicit geometry
+  /// update - the create geometry was already written (for children even the
+  /// 200x200 default is written as real layout), so the node is never in
+  /// natural layout and there is nothing to flip. Flipping happens on the
+  /// MAIN path only: BOTH MAIN creation rows start in natural layout (the
+  /// create style write is gated `is_child && bounds.is_some()`, so a MAIN
+  /// create never carries geometry -- even MAIN with explicit `with_bounds`
+  /// applies nothing at create, its requested rect is cache-only), and the
+  /// first `set_bounds` on either row flips it -- where "the first
+  /// `set_bounds`" means one carrying explicit width/height (a full request,
+  /// or a SetSize-shaped partial); a SetPosition-shaped first request (size
+  /// pair = `i32::MIN` sentinel, skipped by the ArkTS render layer) leaves
+  /// both rows in natural layout. See the render semantics note
+  /// on [`WebView::bounds`].
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
     self.webview.set_bounds(bounds)
   }
@@ -2299,6 +2466,9 @@ pub enum DragDropEvent {
   /// A drag operation has entered the webview.
   Enter {
     /// List of paths that are being dragged onto the webview.
+    ///
+    /// OpenHarmony: always empty -- ArkWeb's drag-enter event carries no path
+    /// list; only [`DragDropEvent::Drop`] carries paths.
     paths: Vec<PathBuf>,
     /// Position of the drag operation, relative to the webview top-left corner.
     position: (i32, i32),
@@ -2582,6 +2752,28 @@ pub trait WebViewExtOhos {
   /// Returns the OHOS webview handle for accessing platform-specific APIs
   /// (e.g., `web_page_snapshot`).
   fn webview_handle(&self) -> OhosWebviewHandle;
+  /// Create a PDF from the current webview content and save to the given path.
+  ///
+  /// The bridge API uses fixed A4 settings when `config` is `None`
+  /// (8.27x11.69in, zero margins, shouldPrintBackground=true).
+  ///
+  /// `callback` receives `true` when the PDF was written to `path`.
+  fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()>;
+  /// Disposes the webview, removing its content from the window.
+  ///
+  /// Sends the remove op to the bridge and marks the webview disposed so the
+  /// `Drop` implementation does not send a duplicate remove. On OpenHarmony
+  /// the disposal is unified: it applies to child webviews (`new_as_child`)
+  /// AND to the main webview -- the previous "no-op for non-child webviews"
+  /// gate leaked the main webview's ArkTS `Web` component on drop. The first
+  /// of `dispose_child` / `Drop` performs the removal; every later call is a
+  /// no-op (idempotent fence).
+  fn dispose_child(&self);
 }
 
 #[cfg(target_env = "ohos")]
@@ -2589,11 +2781,17 @@ impl WebViewExtOhos for WebView {
   fn webview_handle(&self) -> OhosWebviewHandle {
     self.webview.handle()
   }
-}
 
-#[cfg(target_env = "ohos")]
-impl WebView {
-  pub fn dispose_child(&self) {
+  fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    self.webview.create_pdf(path, config, callback)
+  }
+
+  fn dispose_child(&self) {
     self.webview.dispose_child();
   }
 }
@@ -2647,6 +2845,11 @@ pub struct InitializationScript {
   /// - **Windows**: scripts are always injected into subframes regardless of this option.
   ///   This will be the case until Webview2 implements a proper API to inject a script only on the main frame.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
+  /// - **OpenHarmony**: this option is ignored -- scripts are injected into
+  ///   every frame matching the script rules (`"*"` plus the registered
+  ///   custom schemes). Whether `file://` pages are covered by the `"*"`
+  ///   rule is unverified -- do not assume injection there until probed on
+  ///   a device.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
   pub for_main_frame_only: bool,

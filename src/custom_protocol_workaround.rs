@@ -73,26 +73,48 @@ mod tests {
     // External https URLs with an unrelated host must NOT be matched.
     // (Note: the upstream matcher is prefix-based, so a URL like
     // `https://tauri.com/` does match protocol `tauri` — that is upstream
-    // behavior on Windows/Android and is kept as-is; OHOS does its host
-    // check on the ArkTS side and never calls this function.)
-    assert!(!is_work_around_uri("https://example.com/page", "https", "tauri"));
+    // behavior on Windows/Android and is kept as-is. OHOS uses this same
+    // matcher in `dispatch_https_intercept_sync`; its ArkTS side applies the
+    // equivalent gate by checking the first-dot host segment against the
+    // seeded protocol set.)
+    assert!(!is_work_around_uri(
+      "https://example.com/page",
+      "https",
+      "tauri"
+    ));
     // Only https://tauri.localhost/... matches
-    assert!(is_work_around_uri("https://tauri.localhost/page", "https", "tauri"));
+    assert!(is_work_around_uri(
+      "https://tauri.localhost/page",
+      "https",
+      "tauri"
+    ));
   }
 
   #[test]
   fn is_work_around_uri_rejects_non_http_scheme() {
     // A URL with a non-http(s) scheme should not match even if the host looks right
-    assert!(!is_work_around_uri("ftp://wry.localhost/path", "http", "wry"));
+    assert!(!is_work_around_uri(
+      "ftp://wry.localhost/path",
+      "http",
+      "wry"
+    ));
     assert!(!is_work_around_uri("wry://localhost/path", "http", "wry"));
   }
 
   #[test]
   fn is_work_around_uri_rejects_wrong_protocol() {
     // URL registered for "wry" but checked against "asset"
-    assert!(!is_work_around_uri("http://wry.localhost/path", "http", "asset"));
+    assert!(!is_work_around_uri(
+      "http://wry.localhost/path",
+      "http",
+      "asset"
+    ));
     // URL registered for "tauri" but checked against "wry"
-    assert!(!is_work_around_uri("https://tauri.localhost/path", "https", "wry"));
+    assert!(!is_work_around_uri(
+      "https://tauri.localhost/path",
+      "https",
+      "wry"
+    ));
   }
 
   #[test]
@@ -120,10 +142,7 @@ mod tests {
   fn uri_work_around_preserves_query_and_fragment() {
     let original = "tauri://localhost/page?foo=bar#section";
     let worked = apply_uri_work_around(original, "https", "tauri");
-    assert_eq!(
-      worked,
-      "https://tauri.localhost/page?foo=bar#section"
-    );
+    assert_eq!(worked, "https://tauri.localhost/page?foo=bar#section");
     assert!(is_work_around_uri(&worked, "https", "tauri"));
     let reverted = revert_uri_work_around(&worked, "https", "tauri");
     assert_eq!(reverted, original);
@@ -137,10 +156,7 @@ mod tests {
 
   #[test]
   fn work_around_uri_prefix_format() {
-    assert_eq!(
-      work_around_uri_prefix("https", "tauri"),
-      "https://tauri."
-    );
+    assert_eq!(work_around_uri_prefix("https", "tauri"), "https://tauri.");
     assert_eq!(work_around_uri_prefix("http", "wry"), "http://wry.");
   }
 
